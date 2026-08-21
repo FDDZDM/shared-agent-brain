@@ -186,7 +186,7 @@ amm memory remember "Runtime" "This project uses Python 3.12"
 amm memory search "Python"
 ```
 
-> ⚠️ 中文检索注意：FTS5 trigram **查询须 ≥3 字符**，2 字中文词（如"测试"）会搜不到——已知产品边界。
+> 中文检索：≥3 字符走 FTS5 trigram 相关度排序；**1~2 字短查询自动走 LIKE 子串兜底**（服务端已实现），中文短词（如"验证"）也能搜到。
 
 ---
 
@@ -233,7 +233,7 @@ npm run check && npm test && npm run build
 |---|---|
 | Docker Hub / PyPI 被墙 | daemon `registry-mirrors`（1ms.run / daocloud / dockerproxy.net）；构建传 `PIP_INDEX_URL` 清华源 |
 | 系统 Python 的 SQLite 无 trigram | SQLite < 3.34 不支持 trigram → **必须用 Docker**（`python:3.12-slim` 自带新版） |
-| 2 字中文词搜不到 | trigram 查询需 ≥3 字符，已知边界 |
+| 中文短词（1~2 字）搜不到 | 服务端已实现 LIKE 兜底（`db.py` search：<3 字符走 `LIKE '%词%'`），"验证""命"均可命中；FTS trigram 仅用于 ≥3 字符查询 |
 | Hermes provider 不出现 | 发现机制是**目录扫描**（`$HERMES_HOME/plugins/<name>/`），不是 entry point |
 | DSH 插件不生效 | `cordis.yml` 每次启动被重写 → 必须写 `cordis.patch.yml` 的 `insert` 层 |
 | DSH 启动报 token 缺失 | GUI 无环境变量 → 用 `config.token` 字段而非 `tokenEnv` |
