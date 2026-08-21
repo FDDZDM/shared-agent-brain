@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shared-agent-brain"
+version = "0.1.0"
+description = "Self-hosted shared memory backend for Hermes and DeepSeek Harness"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.8,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+]
+
+[project.scripts]
+amm = "shared_brain.cli:main"
+amm-server = "shared_brain.cli:server_main"
+
+[project.entry-points."hermes_agent.memory_providers"]
+shared-brain = "shared_brain.hermes_plugin:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shared_brain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

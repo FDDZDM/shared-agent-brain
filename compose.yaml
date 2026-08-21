@@ -1,0 +1,25 @@
+services:
+  shared-brain:
+    build:
+      context: .
+      args:
+        # 中国大陆构建时: export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    restart: unless-stopped
+    environment:
+      BRAIN_TOKEN: ${BRAIN_TOKEN:?set BRAIN_TOKEN in .env}
+      BRAIN_DB_PATH: /data/shared-brain.db
+    volumes:
+      - brain-data:/data
+    ports:
+      # 默认只绑 127.0.0.1（安全）；远程访问时在 .env 里设 BRAIN_BIND_IP=0.0.0.0
+      - "${BRAIN_BIND_IP:-127.0.0.1}:8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  brain-data:
+

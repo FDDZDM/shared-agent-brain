@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+node_modules
+integrations/deepseek-harness/node_modules
+integrations/deepseek-harness/lib
+data
+__pycache__
+*.pyc
+
