@@ -123,6 +123,15 @@ hermes memory status   # Provider: shared-brain / available ✓
 - `brain_update(memory_id, expected_version, ...)` — 乐观锁更新
 - `brain_forget(memory_id, expected_version)` — tombstone 删除
 
+**斜杠命令**（与 DSH 端同名同义，全端统一词汇）：Hermes 的 memory provider 路径本身不支持注册命令（`kind=exclusive` 路由限制），需在插件 `plugin.yaml` 显式声明 `kind: standalone` 并 `hermes plugins enable shared-brain`，让通用 PluginManager 加载（`register()` 内 hasattr 双守卫兼容两条加载路径）。启用后新会话可用：
+
+```text
+/brain_search <query>                        # 搜索共享记忆
+/brain_remember <title> | <content>          # 存一条事实
+/brain_update <id> <expected_version> | <new content>   # 乐观锁更新
+/brain_forget <id> <expected_version>        # tombstone 删除
+```
+
 ---
 
 ## 三、DSH Desktop 接线（Cordis 插件）

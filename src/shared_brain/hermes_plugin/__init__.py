@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -15,6 +15,7 @@ except ImportError:  # Allows packaging/tests without importing Hermes itself.
 
 from shared_brain.client import BrainClientError, SharedBrainClient
 from shared_brain.config import load_config
+from shared_brain.security import render_untrusted_memories
 
 
 PROVIDER_NAME = "shared-brain"
@@ -243,6 +244,107 @@ class SharedBrainMemoryProvider(MemoryProvider):
             self._client = None
 
 
+def _make_slash_client() -> SharedBrainClient:
+    """Build a client from the same config the provider uses.
+
+    Slash-command handlers have no session context, so they construct a
+    client on demand from ~/.hermes/shared-brain.json + BRAIN_* env vars.
+    """
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    configured = load_config(str(home / "shared-brain.json"))
+    server_url = os.environ.get("BRAIN_URL") or configured.get("server_url")
+    token = os.environ.get("BRAIN_TOKEN") or configured.get("token")
+    agent_id = os.environ.get("BRAIN_AGENT_ID") or configured.get("agent_id") or "hermes"
+    project_key = os.environ.get("BRAIN_PROJECT_KEY") or configured.get("project_key")
+    if not server_url or not token:
+        raise RuntimeError("Shared Brain requires BRAIN_URL and BRAIN_TOKEN (config or env)")
+    return SharedBrainClient(server_url, token, agent_id, project_key, str(home / "shared-brain-queue.db"))
+
+
+def _slash_commands() -> List[tuple]:
+    """(name, args_hint, description, handler) for /brain_* commands.
+
+    Command names are deliberately identical to the brain_* tool names so
+    every agent surface (Hermes tools, Hermes slash commands, DSH tools,
+    DSH slash commands) shares one vocabulary.
+    """
+    def brain_search(raw_args: str) -> str:
+        query = raw_args.strip()
+        if not query:
+            return "Usage: /brain_search <query>"
+        try:
+            items = _make_slash_client().search(query)
+            return render_untrusted_memories(items) if items else "No shared memories matched."
+        except Exception as exc:
+            return f"Shared Brain search failed: {exc}"
+
+    def brain_remember(raw_args: str) -> str:
+        raw = raw_args.strip()
+        sep = raw.find("|")
+        title = (raw[:sep] if sep != -1 else raw[:80]).strip()
+        content = raw[sep + 1:].strip() if sep != -1 else raw
+        if not title or not content:
+            return "Usage: /brain_remember <title> | <content>"
+        try:
+            result = _make_slash_client().remember(title, content)
+            if "queued" in result:
+                return "Saved to offline queue (will sync when back online)."
+            return f"Saved v{result['current_version']}: {result['title']}"
+        except Exception as exc:
+            return f"Shared Brain save failed: {exc}"
+
+    def brain_update(raw_args: str) -> str:
+        raw = raw_args.strip()
+        sep = raw.find("|")
+        head = (raw[:sep] if sep != -1 else raw).split()
+        content = raw[sep + 1:].strip() if sep != -1 else ""
+        if len(head) < 2 or not head[1].isdigit() or not content:
+            return "Usage: /brain_update <memory_id> <expected_version> | <new content>"
+        try:
+            result = _make_slash_client().update(head[0], int(head[1]), content_text=content)
+            if "queued" in result:
+                return "Queued offline (will sync when back online)."
+            return f"Updated to v{result['current_version']}: {result['title']}"
+        except Exception as exc:
+            return f"Shared Brain update failed: {exc}"
+
+    def brain_forget(raw_args: str) -> str:
+        parts = raw_args.strip().split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Usage: /brain_forget <memory_id> <expected_version>"
+        try:
+            result = _make_slash_client().forget(parts[0], int(parts[1]))
+            if "queued" in result:
+                return "Queued offline (will sync when back online)."
+            return f"Forgotten: {result}"
+        except Exception as exc:
+            return f"Shared Brain forget failed: {exc}"
+
+    return [
+        ("brain_search", "<query>", "search Shared Brain for untrusted reference facts", brain_search),
+        ("brain_remember", "<title> | <content>", "save one short durable fact to Shared Brain", brain_remember),
+        (
+            "brain_update",
+            "<memory_id> <expected_version> | <new content>",
+            "create a new version of a Shared Brain memory (optimistic lock)",
+            brain_update,
+        ),
+        ("brain_forget", "<memory_id> <expected_version>", "tombstone a Shared Brain memory (optimistic lock)", brain_forget),
+    ]
+
+
 def register(ctx: Any) -> None:
-    ctx.register_memory_provider(SharedBrainMemoryProvider())
+    """Register with any Hermes loader that exposes the relevant hooks.
+
+    - Memory-provider discovery hands a ``_ProviderCollector`` that only
+      knows ``register_memory_provider`` (no slash commands by design).
+    - The general PluginManager hands a full ``PluginContext`` that knows
+      ``register_command`` but NOT ``register_memory_provider``.
+    Both guards keep this safe under either loader.
+    """
+    if hasattr(ctx, "register_memory_provider"):
+        ctx.register_memory_provider(SharedBrainMemoryProvider())
+    if hasattr(ctx, "register_command"):
+        for name, args_hint, description, handler in _slash_commands():
+            ctx.register_command(name, handler, description, args_hint)
 
