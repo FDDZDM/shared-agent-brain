@@ -195,112 +195,113 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  commands.register({
-    name: 'brain_search',
-    description: 'search Shared Brain for untrusted reference facts',
-    input: { hint: '<query>' },
-    handler: async (invocation) => {
-      const query = invocation.rawInput.trim()
-      if (!query) return { kind: 'error', text: 'Usage: /brain_search <query>' }
-      try {
-        const items = await client.search(query, recallLimit)
-        const text = items.length === 0 ? 'No shared memories matched.' : renderResults(items)
-        steerResult(invocation, 'brain_search', text)
-        return { kind: 'success', text }
-      } catch (error) {
-        const text = `Shared Brain search failed: ${String(error)}`
-        steerResult(invocation, 'brain_search', text)
-        return { kind: 'error', text }
-      }
-    },
-  })
+  const helpText = [
+    'Shared Brain 命令说明书（子命令与 brain_* 工具一一对应）:',
+    '/brain search <query>                          # 搜索共享记忆',
+    '/brain remember <title> | <content>            # 保存一条事实',
+    '/brain update <id> <expected_version> | <new content>   # 乐观锁更新',
+    '/brain forget <id> <expected_version>          # tombstone 删除',
+    '/brain help                                    # 显示本说明书',
+  ].join('\n')
 
   commands.register({
-    name: 'brain_remember',
-    description: 'save one short durable fact to Shared Brain',
-    input: { hint: '<title> | <content>' },
+    name: 'brain',
+    description: 'Shared Brain: search/remember/update/forget memories. Run /brain help for the manual.',
+    input: { hint: '<search|remember|update|forget|help> ...' },
     handler: async (invocation) => {
-      const raw = invocation.rawInput.trim()
-      const sep = raw.indexOf('|')
-      const title = (sep === -1 ? raw.slice(0, 80) : raw.slice(0, sep).trim()).trim()
-      const content = sep === -1 ? raw : raw.slice(sep + 1).trim()
-      if (!title || !content) return { kind: 'error', text: 'Usage: /brain_remember <title> | <content>' }
-      try {
-        const rec = await client.remember({
-          title,
-          content,
-          scope: 'project',
-          kind: 'fact',
-          sessionId: sessionIdOf(invocation),
-        })
-        const text = 'queued' in rec
-          ? 'Saved to offline queue (will sync when back online).'
-          : `Saved v${rec.current_version}: ${rec.title}`
-        steerResult(invocation, 'brain_remember', text)
-        return { kind: 'success', text }
-      } catch (error) {
-        const text = `Shared Brain save failed: ${String(error)}`
-        steerResult(invocation, 'brain_remember', text)
-        return { kind: 'error', text }
-      }
-    },
-  })
+      const [sub, ...rest] = invocation.rawInput.trim().split(/\s+/)
+      const args = rest.join(' ').trim()
+      const command = (sub ?? '').toLowerCase()
+      if (!command || command === 'help') return { kind: 'success', text: helpText }
 
-  commands.register({
-    name: 'brain_update',
-    description: 'create a new version of a Shared Brain memory (optimistic lock)',
-    input: { hint: '<memory_id> <expected_version> | <new content>' },
-    handler: async (invocation) => {
-      const raw = invocation.rawInput.trim()
-      const sep = raw.indexOf('|')
-      const head = (sep === -1 ? raw : raw.slice(0, sep)).trim().split(/\s+/)
-      const id = head[0] ?? ''
-      const version = Number(head[1])
-      const content = sep === -1 ? '' : raw.slice(sep + 1).trim()
-      if (!id || !Number.isInteger(version) || version < 1 || !content) {
-        return { kind: 'error', text: 'Usage: /brain_update <memory_id> <expected_version> | <new content>' }
-      }
-      try {
-        const rec = await client.update({
-          memoryId: id,
-          expectedVersion: version,
-          content,
-          sessionId: sessionIdOf(invocation),
-        })
-        const text = 'queued' in rec
-          ? 'Queued offline (will sync when back online).'
-          : `Updated to v${rec.current_version}: ${rec.title}`
-        steerResult(invocation, 'brain_update', text)
-        return { kind: 'success', text }
-      } catch (error) {
-        const text = `Shared Brain update failed: ${String(error)}`
-        steerResult(invocation, 'brain_update', text)
-        return { kind: 'error', text }
-      }
-    },
-  })
+      const usage = (hint: string) => ({ kind: 'error' as const, text: `Usage: ${hint}` })
 
-  commands.register({
-    name: 'brain_forget',
-    description: 'tombstone a Shared Brain memory (optimistic lock)',
-    input: { hint: '<memory_id> <expected_version>' },
-    handler: async (invocation) => {
-      const [id, version] = invocation.rawInput.trim().split(/\s+/)
-      const v = Number(version)
-      if (!id || !Number.isInteger(v) || v < 1) {
-        return { kind: 'error', text: 'Usage: /brain_forget <memory_id> <expected_version>' }
-      }
-      try {
-        const res = await client.forget(id, v)
-        const text = 'queued' in res
-          ? 'Queued offline (will sync when back online).'
-          : `Forgotten: ${JSON.stringify(res)}`
-        steerResult(invocation, 'brain_forget', text)
-        return { kind: 'success', text }
-      } catch (error) {
-        const text = `Shared Brain forget failed: ${String(error)}`
-        steerResult(invocation, 'brain_forget', text)
-        return { kind: 'error', text }
+      switch (command) {
+        case 'search': {
+          if (!args) return usage('/brain search <query>')
+          try {
+            const items = await client.search(args, recallLimit)
+            const text = items.length === 0 ? 'No shared memories matched.' : renderResults(items)
+            steerResult(invocation, 'brain_search', text)
+            return { kind: 'success', text }
+          } catch (error) {
+            const text = `Shared Brain search failed: ${String(error)}`
+            steerResult(invocation, 'brain_search', text)
+            return { kind: 'error', text }
+          }
+        }
+        case 'remember': {
+          const sep = args.indexOf('|')
+          const title = (sep === -1 ? args.slice(0, 80) : args.slice(0, sep).trim()).trim()
+          const content = sep === -1 ? args : args.slice(sep + 1).trim()
+          if (!title || !content) return usage('/brain remember <title> | <content>')
+          try {
+            const rec = await client.remember({
+              title,
+              content,
+              scope: 'project',
+              kind: 'fact',
+              sessionId: sessionIdOf(invocation),
+            })
+            const text = 'queued' in rec
+              ? 'Saved to offline queue (will sync when back online).'
+              : `Saved v${rec.current_version}: ${rec.title}`
+            steerResult(invocation, 'brain_remember', text)
+            return { kind: 'success', text }
+          } catch (error) {
+            const text = `Shared Brain save failed: ${String(error)}`
+            steerResult(invocation, 'brain_remember', text)
+            return { kind: 'error', text }
+          }
+        }
+        case 'update': {
+          const sep = args.indexOf('|')
+          const head = (sep === -1 ? args : args.slice(0, sep)).trim().split(/\s+/)
+          const id = head[0] ?? ''
+          const version = Number(head[1])
+          const content = sep === -1 ? '' : args.slice(sep + 1).trim()
+          if (!id || !Number.isInteger(version) || version < 1 || !content) {
+            return usage('/brain update <id> <expected_version> | <new content>')
+          }
+          try {
+            const rec = await client.update({
+              memoryId: id,
+              expectedVersion: version,
+              content,
+              sessionId: sessionIdOf(invocation),
+            })
+            const text = 'queued' in rec
+              ? 'Queued offline (will sync when back online).'
+              : `Updated to v${rec.current_version}: ${rec.title}`
+            steerResult(invocation, 'brain_update', text)
+            return { kind: 'success', text }
+          } catch (error) {
+            const text = `Shared Brain update failed: ${String(error)}`
+            steerResult(invocation, 'brain_update', text)
+            return { kind: 'error', text }
+          }
+        }
+        case 'forget': {
+          const [id, version] = args.split(/\s+/)
+          const v = Number(version)
+          if (!id || !Number.isInteger(v) || v < 1) {
+            return usage('/brain forget <id> <expected_version>')
+          }
+          try {
+            const res = await client.forget(id, v)
+            const text = 'queued' in res
+              ? 'Queued offline (will sync when back online).'
+              : `Forgotten: ${JSON.stringify(res)}`
+            steerResult(invocation, 'brain_forget', text)
+            return { kind: 'success', text }
+          } catch (error) {
+            const text = `Shared Brain forget failed: ${String(error)}`
+            steerResult(invocation, 'brain_forget', text)
+            return { kind: 'error', text }
+          }
+        }
+        default:
+          return usage(`/brain ${command} ... — unknown subcommand; /brain help for the manual`)
       }
     },
   })

@@ -126,11 +126,14 @@ hermes memory status   # Provider: shared-brain / available ✓
 **斜杠命令**（与 DSH 端同名同义，全端统一词汇）：Hermes 的 memory provider 路径本身不支持注册命令（`kind=exclusive` 路由限制），需在插件 `plugin.yaml` 显式声明 `kind: standalone` 并 `hermes plugins enable shared-brain`，让通用 PluginManager 加载（`register()` 内 hasattr 双守卫兼容两条加载路径）。启用后新会话可用：
 
 ```text
-/brain_search <query>                        # 搜索共享记忆
-/brain_remember <title> | <content>          # 存一条事实
-/brain_update <id> <expected_version> | <new content>   # 乐观锁更新
-/brain_forget <id> <expected_version>        # tombstone 删除
+/brain search <query>                        # 搜索共享记忆
+/brain remember <title> | <content>          # 存一条事实
+/brain update <id> <expected_version> | <new content>   # 乐观锁更新
+/brain forget <id> <expected_version>        # tombstone 删除
+/brain help                                  # 命令说明书
 ```
+
+与 DSH 端完全同构（单一 `/brain` + 子命令，子命令与 `brain_*` 工具一一对应，命令面与工具面不撞名）。
 
 ---
 
@@ -166,16 +169,17 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 
 插件在**每轮第一步（step 1）前**把召回记忆以 `reference` 引用资料形式注入（在后续指令与用户材料之前），并注册同名 4 个 `brain_*` 工具；断网写入排队到 `.dsh/shared-brain-queue.json`，turn 结束时重放。
 
-**斜杠命令**（结果直接渲染进 UI，不进模型历史、零 token 消耗）：
+**斜杠命令**（单一 `/brain` 命令 + 子命令，用户命令面与 `brain_*` 工具名不撞车；与 Hermes 端完全一致）：
 
 ```text
-/brain_search <query>                        # 搜索共享记忆
-/brain_remember <title> | <content>          # 存一条事实（scope=project）
-/brain_update <id> <expected_version> | <new content>   # 乐观锁更新
-/brain_forget <id> <expected_version>        # tombstone 删除
+/brain search <query>                        # 搜索共享记忆
+/brain remember <title> | <content>          # 存一条事实（scope=project）
+/brain update <id> <expected_version> | <new content>   # 乐观锁更新
+/brain forget <id> <expected_version>        # tombstone 删除
+/brain help                                  # 命令说明书
 ```
 
-命令执行结果会通过 `agent.steer` 以 **plugin notice** 形式**写入会话**（`plugin: shared-brain`），用户可直接在会话中回看；纯 usage 提示不写入避免噪音。注意：写入会话意味着结果进入会话历史，后续轮次的模型上下文可见（有少量 token 成本）。
+`/brain`（无参）与 `/brain help` 显示说明书；命令执行结果通过 `agent.steer` 以 **plugin notice** 形式**写入会话**（`plugin: shared-brain`）供回看，usage/未知子命令提示不写入避免噪音。注意：写入会话意味着结果进入会话历史，后续轮次的模型上下文可见（有少量 token 成本）。
 
 ---
 

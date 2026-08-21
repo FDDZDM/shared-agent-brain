@@ -262,74 +262,87 @@ def _make_slash_client() -> SharedBrainClient:
 
 
 def _slash_commands() -> List[tuple]:
-    """(name, args_hint, description, handler) for /brain_* commands.
+    """(name, args_hint, description, handler) for the /brain command.
 
-    Command names are deliberately identical to the brain_* tool names so
-    every agent surface (Hermes tools, Hermes slash commands, DSH tools,
-    DSH slash commands) shares one vocabulary.
+    One command with subcommands keeps the user-facing surface distinct from
+    the brain_* tool names (no collision between tools and commands), while
+    staying identical across Hermes and DSH. /brain (bare) or /brain help
+    shows the manual.
     """
-    def brain_search(raw_args: str) -> str:
-        query = raw_args.strip()
-        if not query:
-            return "Usage: /brain_search <query>"
-        try:
-            items = _make_slash_client().search(query)
-            return render_untrusted_memories(items) if items else "No shared memories matched."
-        except Exception as exc:
-            return f"Shared Brain search failed: {exc}"
+    help_text = "\n".join([
+        "Shared Brain 命令说明书（子命令与 brain_* 工具一一对应）:",
+        "/brain search <query>                          # 搜索共享记忆",
+        "/brain remember <title> | <content>            # 保存一条事实",
+        "/brain update <id> <expected_version> | <new content>   # 乐观锁更新",
+        "/brain forget <id> <expected_version>          # tombstone 删除",
+        "/brain help                                    # 显示本说明书",
+    ])
 
-    def brain_remember(raw_args: str) -> str:
-        raw = raw_args.strip()
-        sep = raw.find("|")
-        title = (raw[:sep] if sep != -1 else raw[:80]).strip()
-        content = raw[sep + 1:].strip() if sep != -1 else raw
-        if not title or not content:
-            return "Usage: /brain_remember <title> | <content>"
+    def brain_command(raw_args: str) -> str:
+        parts = raw_args.strip().split(None, 1)
+        sub = parts[0].lower() if parts else ""
+        args = parts[1].strip() if len(parts) > 1 else ""
+        if not sub or sub == "help":
+            return help_text
         try:
-            result = _make_slash_client().remember(title, content)
-            if "queued" in result:
-                return "Saved to offline queue (will sync when back online)."
-            return f"Saved v{result['current_version']}: {result['title']}"
+            client = _make_slash_client()
         except Exception as exc:
-            return f"Shared Brain save failed: {exc}"
+            return f"Shared Brain is not configured: {exc}"
 
-    def brain_update(raw_args: str) -> str:
-        raw = raw_args.strip()
-        sep = raw.find("|")
-        head = (raw[:sep] if sep != -1 else raw).split()
-        content = raw[sep + 1:].strip() if sep != -1 else ""
-        if len(head) < 2 or not head[1].isdigit() or not content:
-            return "Usage: /brain_update <memory_id> <expected_version> | <new content>"
-        try:
-            result = _make_slash_client().update(head[0], int(head[1]), content_text=content)
-            if "queued" in result:
-                return "Queued offline (will sync when back online)."
-            return f"Updated to v{result['current_version']}: {result['title']}"
-        except Exception as exc:
-            return f"Shared Brain update failed: {exc}"
-
-    def brain_forget(raw_args: str) -> str:
-        parts = raw_args.strip().split()
-        if len(parts) < 2 or not parts[1].isdigit():
-            return "Usage: /brain_forget <memory_id> <expected_version>"
-        try:
-            result = _make_slash_client().forget(parts[0], int(parts[1]))
-            if "queued" in result:
-                return "Queued offline (will sync when back online)."
-            return f"Forgotten: {result}"
-        except Exception as exc:
-            return f"Shared Brain forget failed: {exc}"
+        if sub == "search":
+            if not args:
+                return "Usage: /brain search <query>"
+            try:
+                items = client.search(args)
+                return render_untrusted_memories(items) if items else "No shared memories matched."
+            except Exception as exc:
+                return f"Shared Brain search failed: {exc}"
+        if sub == "remember":
+            sep = args.find("|")
+            title = (args[:sep] if sep != -1 else args[:80]).strip()
+            content = args[sep + 1:].strip() if sep != -1 else args
+            if not title or not content:
+                return "Usage: /brain remember <title> | <content>"
+            try:
+                result = client.remember(title, content)
+                if "queued" in result:
+                    return "Saved to offline queue (will sync when back online)."
+                return f"Saved v{result['current_version']}: {result['title']}"
+            except Exception as exc:
+                return f"Shared Brain save failed: {exc}"
+        if sub == "update":
+            sep = args.find("|")
+            head = (args[:sep] if sep != -1 else args).split()
+            content = args[sep + 1:].strip() if sep != -1 else ""
+            if len(head) < 2 or not head[1].isdigit() or not content:
+                return "Usage: /brain update <id> <expected_version> | <new content>"
+            try:
+                result = client.update(head[0], int(head[1]), content_text=content)
+                if "queued" in result:
+                    return "Queued offline (will sync when back online)."
+                return f"Updated to v{result['current_version']}: {result['title']}"
+            except Exception as exc:
+                return f"Shared Brain update failed: {exc}"
+        if sub == "forget":
+            head = args.split()
+            if len(head) < 2 or not head[1].isdigit():
+                return "Usage: /brain forget <id> <expected_version>"
+            try:
+                result = client.forget(head[0], int(head[1]))
+                if "queued" in result:
+                    return "Queued offline (will sync when back online)."
+                return f"Forgotten: {result}"
+            except Exception as exc:
+                return f"Shared Brain forget failed: {exc}"
+        return f"/brain {sub} ... — unknown subcommand; /brain help for the manual"
 
     return [
-        ("brain_search", "<query>", "search Shared Brain for untrusted reference facts", brain_search),
-        ("brain_remember", "<title> | <content>", "save one short durable fact to Shared Brain", brain_remember),
         (
-            "brain_update",
-            "<memory_id> <expected_version> | <new content>",
-            "create a new version of a Shared Brain memory (optimistic lock)",
-            brain_update,
+            "brain",
+            "<search|remember|update|forget|help> ...",
+            "Shared Brain: search/remember/update/forget memories. /brain help for the manual.",
+            brain_command,
         ),
-        ("brain_forget", "<memory_id> <expected_version>", "tombstone a Shared Brain memory (optimistic lock)", brain_forget),
     ]
 
 
