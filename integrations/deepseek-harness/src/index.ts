@@ -176,6 +176,24 @@ export function apply(ctx: Context, config: Config): void {
   }
   const renderResults = (items: MemoryRecord[]): string =>
     renderUntrustedMemories(items) ?? 'No shared memories matched.'
+  // 把命令结果以 plugin notice 消息写入会话，供用户在会话中回看（plan-mode 同款模式）。
+  const steerResult = (invocation: CommandInvocation, commandName: string, text: string): void => {
+    const agent = invocation.agent as { steer?: (message: UserMessage) => unknown } | undefined
+    if (!agent?.steer || !text) return
+    try {
+      agent.steer(createUserMessage({
+        content: [{ type: 'text', text }],
+        source: {
+          kind: 'plugin',
+          plugin: 'shared-brain',
+          form: 'notice',
+          summary: `Shared Brain: ${commandName}`,
+        } as unknown as UserMessage['source'],
+      }))
+    } catch {
+      // best-effort: 失败时命令结果仍会渲染在 UI 命令平面
+    }
+  }
 
   commands.register({
     name: 'brain_search',
@@ -186,12 +204,13 @@ export function apply(ctx: Context, config: Config): void {
       if (!query) return { kind: 'error', text: 'Usage: /brain_search <query>' }
       try {
         const items = await client.search(query, recallLimit)
-        return {
-          kind: 'success',
-          text: items.length === 0 ? 'No shared memories matched.' : renderResults(items),
-        }
+        const text = items.length === 0 ? 'No shared memories matched.' : renderResults(items)
+        steerResult(invocation, 'brain_search', text)
+        return { kind: 'success', text }
       } catch (error) {
-        return { kind: 'error', text: `Shared Brain search failed: ${String(error)}` }
+        const text = `Shared Brain search failed: ${String(error)}`
+        steerResult(invocation, 'brain_search', text)
+        return { kind: 'error', text }
       }
     },
   })
@@ -214,10 +233,15 @@ export function apply(ctx: Context, config: Config): void {
           kind: 'fact',
           sessionId: sessionIdOf(invocation),
         })
-        if ('queued' in rec) return { kind: 'success', text: 'Saved to offline queue (will sync when back online).' }
-        return { kind: 'success', text: `Saved v${rec.current_version}: ${rec.title}` }
+        const text = 'queued' in rec
+          ? 'Saved to offline queue (will sync when back online).'
+          : `Saved v${rec.current_version}: ${rec.title}`
+        steerResult(invocation, 'brain_remember', text)
+        return { kind: 'success', text }
       } catch (error) {
-        return { kind: 'error', text: `Shared Brain save failed: ${String(error)}` }
+        const text = `Shared Brain save failed: ${String(error)}`
+        steerResult(invocation, 'brain_remember', text)
+        return { kind: 'error', text }
       }
     },
   })
@@ -243,10 +267,15 @@ export function apply(ctx: Context, config: Config): void {
           content,
           sessionId: sessionIdOf(invocation),
         })
-        if ('queued' in rec) return { kind: 'success', text: 'Queued offline (will sync when back online).' }
-        return { kind: 'success', text: `Updated to v${rec.current_version}: ${rec.title}` }
+        const text = 'queued' in rec
+          ? 'Queued offline (will sync when back online).'
+          : `Updated to v${rec.current_version}: ${rec.title}`
+        steerResult(invocation, 'brain_update', text)
+        return { kind: 'success', text }
       } catch (error) {
-        return { kind: 'error', text: `Shared Brain update failed: ${String(error)}` }
+        const text = `Shared Brain update failed: ${String(error)}`
+        steerResult(invocation, 'brain_update', text)
+        return { kind: 'error', text }
       }
     },
   })
@@ -263,9 +292,15 @@ export function apply(ctx: Context, config: Config): void {
       }
       try {
         const res = await client.forget(id, v)
-        return { kind: 'success', text: JSON.stringify(res) }
+        const text = 'queued' in res
+          ? 'Queued offline (will sync when back online).'
+          : `Forgotten: ${JSON.stringify(res)}`
+        steerResult(invocation, 'brain_forget', text)
+        return { kind: 'success', text }
       } catch (error) {
-        return { kind: 'error', text: `Shared Brain forget failed: ${String(error)}` }
+        const text = `Shared Brain forget failed: ${String(error)}`
+        steerResult(invocation, 'brain_forget', text)
+        return { kind: 'error', text }
       }
     },
   })
