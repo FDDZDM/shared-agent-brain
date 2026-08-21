@@ -130,6 +130,7 @@ hermes memory status   # Provider: shared-brain / available ✓
 /brain remember <title> | <content>          # 存一条事实
 /brain update <id> <expected_version> | <new content>   # 乐观锁更新
 /brain forget <id> <expected_version>        # tombstone 删除
+/brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
 /brain help                                  # 命令说明书
 ```
 
@@ -176,6 +177,7 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 /brain remember <title> | <content>          # 存一条事实（scope=project）
 /brain update <id> <expected_version> | <new content>   # 乐观锁更新
 /brain forget <id> <expected_version>        # tombstone 删除
+/brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
 /brain help                                  # 命令说明书
 ```
 
@@ -227,9 +229,10 @@ npm run check && npm test && npm run build
 
 端到端验收（部署/接线后）：
 1. 服务器 `/health` 200；无 token 401。
-2. Hermes 新会话 `prefetch` 注入（带 `untrusted-reference-data` 安全边界声明）。
-3. DSH 会话 `brain_search`/`brain_remember` 可用，step 1 前自动注入引用资料。
-4. 两端写同一 `project_key` 的记忆互相可见。
+2. 任一端会话执行 **`/brain test`**：12 项自检（连通/鉴权/配置/写入/FTS 中文检索/LIKE 短词/乐观锁 409/版本更新/幂等/项目隔离/tombstone/数据清理）全部通过，测试报告写入会话窗口；`/brain test quick` 为快速版（5 项 + 清理）。
+3. Hermes 新会话 `prefetch` 注入（带 `untrusted-reference-data` 安全边界声明）。
+4. DSH 会话 `brain_search`/`brain_remember` 可用，step 1 前自动注入引用资料。
+5. 两端写同一 `project_key` 的记忆互相可见。
 
 ---
 

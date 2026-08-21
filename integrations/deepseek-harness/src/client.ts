@@ -90,10 +90,10 @@ export class SharedBrainClient {
     }
   }
 
-  async search(query: string, limit = 10): Promise<MemoryRecord[]> {
+  async search(query: string, limit = 10, projectKey?: string): Promise<MemoryRecord[]> {
     const params = new URLSearchParams({
       q: query,
-      project_key: this.options.projectKey,
+      project_key: projectKey ?? this.options.projectKey,
       limit: String(limit),
     })
     const result = await this.request<{ items: MemoryRecord[] }>('GET', `/v1/memories/search?${params}`)
@@ -107,12 +107,13 @@ export class SharedBrainClient {
     kind?: MemoryRecord['kind']
     trustLevel?: number
     sessionId?: string
+    projectKey?: string
   }): Promise<MemoryRecord | { queued: true; op_key: string }> {
     const scope = input.scope ?? 'project'
     return this.write('POST', '/v1/memories', {
       scope,
       kind: input.kind ?? 'fact',
-      project_key: scope === 'project' ? this.options.projectKey : null,
+      project_key: scope === 'project' ? (input.projectKey ?? this.options.projectKey) : null,
       title: input.title,
       content_text: input.content,
       source_agent: this.options.agentId,

@@ -16,6 +16,7 @@ except ImportError:  # Allows packaging/tests without importing Hermes itself.
 from shared_brain.client import BrainClientError, SharedBrainClient
 from shared_brain.config import load_config
 from shared_brain.security import render_untrusted_memories
+from shared_brain.selftest import run_selftest
 
 
 PROVIDER_NAME = "shared-brain"
@@ -275,6 +276,7 @@ def _slash_commands() -> List[tuple]:
         "/brain remember <title> | <content>            # 保存一条事实",
         "/brain update <id> <expected_version> | <new content>   # 乐观锁更新",
         "/brain forget <id> <expected_version>          # tombstone 删除",
+        "/brain test [quick]                             # 运行全链路自检并显示报告",
         "/brain help                                    # 显示本说明书",
     ])
 
@@ -334,6 +336,14 @@ def _slash_commands() -> List[tuple]:
                 return f"Forgotten: {result}"
             except Exception as exc:
                 return f"Shared Brain forget failed: {exc}"
+        if sub == "test":
+            quick = args == "quick"
+            if args and not quick:
+                return "Usage: /brain test [quick]"
+            try:
+                return run_selftest(client, quick=quick)["text"]
+            except Exception as exc:
+                return f"Shared Brain selftest failed: {exc}"
         return f"/brain {sub} ... — unknown subcommand; /brain help for the manual"
 
     return [

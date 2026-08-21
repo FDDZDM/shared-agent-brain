@@ -7,6 +7,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { renderUntrustedMemories, SharedBrainClient, type MemoryRecord } from './client.js'
 import { JsonOperationQueue } from './queue.js'
+import { runSelftest } from './selftest.js'
 
 export const name = 'shared-brain'
 export const inject = ['commands', 'tools']
@@ -201,6 +202,7 @@ export function apply(ctx: Context, config: Config): void {
     '/brain remember <title> | <content>            # 保存一条事实',
     '/brain update <id> <expected_version> | <new content>   # 乐观锁更新',
     '/brain forget <id> <expected_version>          # tombstone 删除',
+    '/brain test [quick]                             # 运行全链路自检并显示报告',
     '/brain help                                    # 显示本说明书',
   ].join('\n')
 
@@ -297,6 +299,19 @@ export function apply(ctx: Context, config: Config): void {
           } catch (error) {
             const text = `Shared Brain forget failed: ${String(error)}`
             steerResult(invocation, 'brain_forget', text)
+            return { kind: 'error', text }
+          }
+        }
+        case 'test': {
+          const quick = args === 'quick'
+          if (args && !quick) return usage('/brain test [quick]')
+          try {
+            const report = await runSelftest(client, { quick })
+            steerResult(invocation, 'brain_test', report.text)
+            return { kind: report.passed ? 'success' : 'error', text: report.text }
+          } catch (error) {
+            const text = `Shared Brain selftest failed: ${String(error)}`
+            steerResult(invocation, 'brain_test', text)
             return { kind: 'error', text }
           }
         }
