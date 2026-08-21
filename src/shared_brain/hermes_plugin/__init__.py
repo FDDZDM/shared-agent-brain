@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -235,6 +237,26 @@ class SharedBrainMemoryProvider(MemoryProvider):
             # Offline writes have already been queued; hook failures must not break Hermes memory writes.
             return
 
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """会话结束时把元数据上报到服务器会话目录（remember 选择器的数据源）。"""
+        if self._client is None or not self._session_id:
+            return
+        try:
+            title = ""
+            for message in messages:
+                content = message.get("content", "")
+                if message.get("role") == "user" and isinstance(content, str) and content.strip():
+                    title = content.strip()[:80]
+                    break
+            self._client.upsert_session(
+                str(self._config.get("agent_id") or "hermes"),
+                self._session_id,
+                title or None,
+                datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            return
+
     def shutdown(self) -> None:
         if self._client is not None:
             try:
@@ -243,6 +265,32 @@ class SharedBrainMemoryProvider(MemoryProvider):
                 pass
             self._client.close()
             self._client = None
+
+
+def _read_hermes_session_text(session_id: str, limit_chars: int = 8000) -> str:
+    """从 Hermes state.db 只读提取会话消息文本（remember 上传的内容源）。"""
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    db_path = home / "state.db"
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id LIMIT 300",
+                (session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    parts = []
+    for role, content in rows:
+        if not content:
+            continue
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        parts.append(f"{role}: {text[:400]}")
+    return "\n".join(parts)[:limit_chars]
 
 
 def _make_slash_client() -> SharedBrainClient:
@@ -272,12 +320,13 @@ def _slash_commands() -> List[tuple]:
     """
     help_text = "\n".join([
         "Shared Brain 命令说明书（子命令与 brain_* 工具一一对应）:",
-        "/brain search <query>                          # 搜索共享记忆",
-        "/brain remember <title> | <content>            # 保存一条事实",
-        "/brain update <id> <expected_version> | <new content>   # 乐观锁更新",
-        "/brain forget <id> <expected_version>          # tombstone 删除",
-        "/brain test [quick]                             # 运行全链路自检并显示报告",
-        "/brain help                                    # 显示本说明书",
+        "/brain（无参）                                # 列表选择模式：先选 agent 再选会话/记忆",
+        "/brain search <query>                        # 搜索共享记忆（无参=浏览最近记忆）",
+        "/brain remember [<title> | <content>]        # 无参=列未上传会话选编号上传；带参=直接保存",
+        "/brain update [<id> <expected_version> | <new content>]   # 无参=列记忆选编号更新",
+        "/brain forget [<id> <expected_version>]      # 无参=列记忆选编号删除",
+        "/brain test [quick]                          # 运行全链路自检并显示报告",
+        "/brain help                                  # 显示本说明书",
     ])
 
     def brain_command(raw_args: str) -> str:
@@ -293,13 +342,86 @@ def _slash_commands() -> List[tuple]:
 
         if sub == "search":
             if not args:
-                return "Usage: /brain search <query>"
+                # 无参：列最近记忆（编号），/brain search <编号> 看详情
+                try:
+                    memories = client.list_recent_memories(limit=20)
+                    if not memories:
+                        return "暂无记忆。"
+                    lines = ["最近记忆（输入 /brain search <编号> 查看详情）:"]
+                    for i, m in enumerate(memories, 1):
+                        lines.append(
+                            f"  {i}. [{m['source_agent']}] {m['title'][:40]}（v{m['current_version']}）"
+                        )
+                    return "\n".join(lines)
+                except Exception as exc:
+                    return f"Shared Brain search failed: {exc}"
+            if args.isdigit():
+                # 编号 → 详情
+                try:
+                    memories = client.list_recent_memories(limit=50)
+                    idx = int(args) - 1
+                    if idx < 0 or idx >= len(memories):
+                        return f"编号越界（共 {len(memories)} 条记忆）"
+                    return render_untrusted_memories([memories[idx]])
+                except Exception as exc:
+                    return f"Shared Brain search failed: {exc}"
             try:
                 items = client.search(args)
                 return render_untrusted_memories(items) if items else "No shared memories matched."
             except Exception as exc:
                 return f"Shared Brain search failed: {exc}"
         if sub == "remember":
+            if not args:
+                # 无参：列未上传会话（编号选择，先显示 agent 归属）
+                try:
+                    sessions = client.list_sessions(synced=False, limit=100)
+                    if not sessions:
+                        return (
+                            "没有未上传的会话（会话结束时会自动上报）。\n"
+                            "用法: /brain remember <title> | <content> 直接保存"
+                        )
+                    lines = [
+                        "未上传的会话（输入 /brain remember <编号> <标题> 上传；"
+                        "Hermes 端上传原始会话文本、不做提炼）:"
+                    ]
+                    for i, s in enumerate(sessions, 1):
+                        lines.append(
+                            f"  {i}. [{s['agent_id']}] {s['title'] or s['session_id'][:12]}"
+                            f"（{s['updated_at'][:16]}）"
+                        )
+                    return "\n".join(lines)
+                except Exception as exc:
+                    return f"Shared Brain save failed: {exc}"
+            if "|" not in args:
+                parts = args.split(None, 1)
+                if parts and parts[0].isdigit():
+                    # 编号 + 标题：从服务器目录取会话 → 读本机会话文本 → 上传
+                    try:
+                        sessions = client.list_sessions(synced=False, limit=100)
+                        idx = int(parts[0]) - 1
+                        if idx < 0 or idx >= len(sessions):
+                            return f"编号越界（共 {len(sessions)} 个未上传会话）"
+                        session = sessions[idx]
+                        title = parts[1].strip() if len(parts) > 1 else (session["title"] or "Hermes 会话")
+                        content = _read_hermes_session_text(session["session_id"])
+                        if not content:
+                            return "无法读取会话内容（state.db 未找到该会话）"
+                        result = client.remember(
+                            title,
+                            content,
+                            scope="project",
+                            kind="fact",
+                            source_session_id=session["session_id"],
+                        )
+                        if "queued" in result:
+                            return "Saved to offline queue (will sync when back online)."
+                        client.mark_session_synced(session["agent_id"], session["session_id"])
+                        return (
+                            f"✅ 已上传 v{result['current_version']}: {result['title']}"
+                            f"（{session['agent_id']} 的会话已标记）"
+                        )
+                    except Exception as exc:
+                        return f"Shared Brain save failed: {exc}"
             sep = args.find("|")
             title = (args[:sep] if sep != -1 else args[:80]).strip()
             content = args[sep + 1:].strip() if sep != -1 else args
@@ -313,6 +435,39 @@ def _slash_commands() -> List[tuple]:
             except Exception as exc:
                 return f"Shared Brain save failed: {exc}"
         if sub == "update":
+            if not args:
+                # 无参：列最近记忆（编号）
+                try:
+                    memories = client.list_recent_memories(limit=20)
+                    if not memories:
+                        return "暂无记忆。"
+                    lines = ["最近记忆（输入 /brain update <编号> <新内容> 更新）:"]
+                    for i, m in enumerate(memories, 1):
+                        lines.append(
+                            f"  {i}. [{m['source_agent']}] {m['title'][:40]}（v{m['current_version']}）"
+                        )
+                    return "\n".join(lines)
+                except Exception as exc:
+                    return f"Shared Brain update failed: {exc}"
+            parts = args.split(None, 1)
+            if parts and parts[0].isdigit() and len(parts) > 1:
+                # 编号 + 新内容
+                try:
+                    memories = client.list_recent_memories(limit=50)
+                    idx = int(parts[0]) - 1
+                    if idx < 0 or idx >= len(memories):
+                        return f"编号越界（共 {len(memories)} 条记忆）"
+                    target = memories[idx]
+                    result = client.update(
+                        target["id"],
+                        target["current_version"],
+                        content_text=parts[1].strip(),
+                    )
+                    if "queued" in result:
+                        return "Queued offline (will sync when back online)."
+                    return f"Updated to v{result['current_version']}: {result['title']}"
+                except Exception as exc:
+                    return f"Shared Brain update failed: {exc}"
             sep = args.find("|")
             head = (args[:sep] if sep != -1 else args).split()
             content = args[sep + 1:].strip() if sep != -1 else ""
@@ -326,6 +481,34 @@ def _slash_commands() -> List[tuple]:
             except Exception as exc:
                 return f"Shared Brain update failed: {exc}"
         if sub == "forget":
+            if not args:
+                # 无参：列最近记忆（编号）
+                try:
+                    memories = client.list_recent_memories(limit=20)
+                    if not memories:
+                        return "暂无记忆。"
+                    lines = ["最近记忆（输入 /brain forget <编号> 删除）:"]
+                    for i, m in enumerate(memories, 1):
+                        lines.append(
+                            f"  {i}. [{m['source_agent']}] {m['title'][:40]}（v{m['current_version']}）"
+                        )
+                    return "\n".join(lines)
+                except Exception as exc:
+                    return f"Shared Brain forget failed: {exc}"
+            if args.isdigit():
+                # 编号 → 删除
+                try:
+                    memories = client.list_recent_memories(limit=50)
+                    idx = int(args) - 1
+                    if idx < 0 or idx >= len(memories):
+                        return f"编号越界（共 {len(memories)} 条记忆）"
+                    target = memories[idx]
+                    result = client.forget(target["id"], target["current_version"])
+                    if "queued" in result:
+                        return "Queued offline (will sync when back online)."
+                    return f"Forgotten: {target['title'][:40]}"
+                except Exception as exc:
+                    return f"Shared Brain forget failed: {exc}"
             head = args.split()
             if len(head) < 2 or not head[1].isdigit():
                 return "Usage: /brain forget <id> <expected_version>"

@@ -126,15 +126,23 @@ hermes memory status   # Provider: shared-brain / available ✓
 **斜杠命令**（与 DSH 端同名同义，全端统一词汇）：Hermes 的 memory provider 路径本身不支持注册命令（`kind=exclusive` 路由限制），需在插件 `plugin.yaml` 显式声明 `kind: standalone` 并 `hermes plugins enable shared-brain`，让通用 PluginManager 加载（`register()` 内 hasattr 双守卫兼容两条加载路径）。启用后新会话可用：
 
 ```text
-/brain search <query>                        # 搜索共享记忆
-/brain remember <title> | <content>          # 存一条事实
-/brain update <id> <expected_version> | <new content>   # 乐观锁更新
-/brain forget <id> <expected_version>        # tombstone 删除
+/brain（无参）                                 # 列表选择模式：先选 agent 再选会话/记忆
+/brain search <query>                        # 搜索共享记忆（无参=浏览最近记忆）
+/brain remember [<title> | <content>]        # 无参=选未上传会话自动提炼上传；带参=直接保存
+/brain update [<id> <expected_version> | <new content>]   # 无参=选记忆后输入新内容
+/brain forget [<id> <expected_version>]      # 无参=选记忆后确认删除
 /brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
 /brain help                                  # 命令说明书
 ```
 
 与 DSH 端完全同构（单一 `/brain` + 子命令，子命令与 `brain_*` 工具一一对应，命令面与工具面不撞名）。
+
+**交互设计（v2，列表选择优先）**：无参调用不再要求手输，而是**从服务器拉候选列表让用户选择**——
+`remember` 先列 agent（init 时配置的 agent name，如 `Mac-Hermes`）→ 列该 agent 的**未上传会话** →
+手动设标题 → DSH 端由模型自动提炼会话内容入库；`update`/`forget` 按 agent 分组列记忆后选择；
+`search` 无参浏览最近记忆。会话目录（agent → 会话）由各客户端在会话结束时自动上报到服务器
+（Hermes 用 `on_session_end`，DSH 用 `session/event` turn/end）。平台差异：DSH 端有弹窗选择 +
+LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题>`），上传原始会话文本（未提炼）。
 
 ---
 
@@ -205,11 +213,18 @@ amm memory search "Python"
 ```text
 POST   /v1/memories
 GET    /v1/memories/search?q=...&project_key=...&scope=...&kind=...&min_trust_level=...
+GET    /v1/memories?project_key=...&source_agent=...          # 最近记忆列表（选择器数据源）
 GET    /v1/memories/changes?cursor=...&project_key=...
 GET    /v1/memories/{id}
 GET    /v1/memories/{id}/versions
 POST   /v1/memories/{id}/versions          # 乐观锁：body 带 expected_version
 DELETE /v1/memories/{id}                   # tombstone：body 带 expected_version
+
+# 会话目录（remember 的 agent → 会话两级选择）
+POST   /v1/sessions                        # 客户端上报会话元数据（幂等 upsert，synced 状态保留）
+GET    /v1/sessions?agent=...&synced=false # 按 agent 列会话（可筛未上传）
+GET    /v1/sessions/agents                 # distinct agent + 未上传计数
+POST   /v1/sessions/{agent}/{session}/synced   # 标记会话已上传
 ```
 
 OpenAPI 文档：服务运行中访问 `/docs`。

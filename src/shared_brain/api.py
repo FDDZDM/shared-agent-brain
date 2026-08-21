@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from .db import BrainStore
 from .errors import BrainError, ConflictError, NotFoundError, ValidationError
-from .models import MemoryCreate, MemoryDelete, MemoryKind, MemoryScope, MemoryUpdate
+from .models import MemoryCreate, MemoryDelete, MemoryKind, MemoryScope, MemoryUpdate, SessionCreate
 from .security import request_hash, verify_token
 
 
@@ -96,6 +96,21 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
         )
         return {"items": items, "count": len(items)}
 
+    @app.get("/v1/memories", dependencies=[Depends(authenticate)])
+    def list_memories(
+        scope: Optional[MemoryScope] = None,
+        project_key: Optional[str] = Query(default=None, max_length=255),
+        source_agent: Optional[str] = Query(default=None, max_length=128),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict:
+        items = store.list_recent_memories(
+            scope=scope.value if scope else None,
+            project_key=project_key,
+            source_agent=source_agent,
+            limit=limit,
+        )
+        return {"items": items, "count": len(items)}
+
     @app.get("/v1/memories/changes", dependencies=[Depends(authenticate)])
     def memory_changes(
         cursor: int = Query(default=0, ge=0),
@@ -142,6 +157,32 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
             request_hash("DELETE", path, payload),
         )
         return JSONResponse(status_code=status, content=result)
+
+    # -- 会话目录 -------------------------------------------------------------
+
+    @app.post("/v1/sessions", dependencies=[Depends(authenticate)])
+    def upsert_session(body: SessionCreate) -> dict:
+        return store.upsert_session(
+            body.agent_id, body.session_id, body.title, body.updated_at
+        )
+
+    @app.post("/v1/sessions/{agent_id}/{session_id}/synced", dependencies=[Depends(authenticate)])
+    def mark_session_synced(agent_id: str, session_id: str) -> dict:
+        return store.mark_session_synced(agent_id, session_id)
+
+    @app.get("/v1/sessions", dependencies=[Depends(authenticate)])
+    def list_sessions(
+        agent: Optional[str] = Query(default=None, max_length=128),
+        synced: Optional[bool] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        items = store.list_sessions(agent_id=agent, synced=synced, limit=limit)
+        return {"items": items, "count": len(items)}
+
+    @app.get("/v1/sessions/agents", dependencies=[Depends(authenticate)])
+    def list_agents() -> dict:
+        items = store.list_agents()
+        return {"items": items, "count": len(items)}
 
     return app
 

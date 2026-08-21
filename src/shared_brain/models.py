@@ -59,3 +59,10 @@ class MemoryDelete(MemoryModel):
     expected_version: int = Field(ge=1)
     source_agent: str = Field(min_length=1, max_length=128)
 
+
+class SessionCreate(MemoryModel):
+    agent_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=255)
+    title: Optional[str] = Field(default=None, max_length=300)
+    updated_at: str = Field(min_length=1, max_length=64)
+

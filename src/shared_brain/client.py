@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib import parse as urlparse
 
 import httpx
 
@@ -164,6 +165,73 @@ class SharedBrainClient:
         return render_untrusted_memories(
             self.search(query, limit=limit, min_trust_level=min_trust_level)
         )
+
+    def list_recent_memories(
+        self,
+        project_key: Optional[str] = None,
+        source_agent: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "project_key": project_key if project_key is not None else self.project_key,
+            "limit": limit,
+        }
+        if source_agent:
+            params["source_agent"] = source_agent
+        response = self._client.get("/v1/memories", params=params)
+        if response.status_code >= 400:
+            raise BrainClientError(f"{response.status_code}: {response.text}")
+        return response.json()["items"]
+
+    def upsert_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        title: Optional[str],
+        updated_at: str,
+    ) -> Dict[str, Any]:
+        response = self._client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "title": title,
+                "updated_at": updated_at,
+            },
+        )
+        if response.status_code >= 400:
+            raise BrainClientError(f"{response.status_code}: {response.text}")
+        return response.json()
+
+    def mark_session_synced(self, agent_id: str, session_id: str) -> Dict[str, Any]:
+        agent = urlparse.quote(agent_id, safe="")
+        session = urlparse.quote(session_id, safe="")
+        response = self._client.post(f"/v1/sessions/{agent}/{session}/synced")
+        if response.status_code >= 400:
+            raise BrainClientError(f"{response.status_code}: {response.text}")
+        return response.json()
+
+    def list_sessions(
+        self,
+        agent: Optional[str] = None,
+        synced: Optional[bool] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"limit": limit}
+        if agent:
+            params["agent"] = agent
+        if synced is not None:
+            params["synced"] = str(synced).lower()
+        response = self._client.get("/v1/sessions", params=params)
+        if response.status_code >= 400:
+            raise BrainClientError(f"{response.status_code}: {response.text}")
+        return response.json()["items"]
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        response = self._client.get("/v1/sessions/agents")
+        if response.status_code >= 400:
+            raise BrainClientError(f"{response.status_code}: {response.text}")
+        return response.json()["items"]
 
     def flush_queue(self, limit: int = 100) -> Dict[str, int]:
         sent = 0

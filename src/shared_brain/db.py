@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS memory_change_log (
 
 CREATE INDEX IF NOT EXISTS idx_memory_change_log_memory
   ON memory_change_log(memory_id, seq);
+
+-- 会话目录：各客户端上报自己的会话元数据，供跨 agent 的选择器（remember/update/forget）使用。
+-- agent_id = 客户端 init 时配置的身份名；synced_at = 会话内容已提炼入库的时间戳（NULL = 未上传）。
+CREATE TABLE IF NOT EXISTS sessions (
+  agent_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  title TEXT,
+  updated_at TEXT NOT NULL,
+  synced_at TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (agent_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_updated
+  ON sessions(agent_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_synced
+  ON sessions(agent_id, synced_at);
 """
 
 
@@ -438,6 +455,36 @@ class BrainStore:
                 rows = conn.execute(sql, (*params, phrase, limit)).fetchall()
             return [self._row_to_memory(row) for row in rows]
 
+    def list_recent_memories(
+        self,
+        scope: Optional[str] = None,
+        project_key: Optional[str] = None,
+        source_agent: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """最近记忆列表（update/forget/search 无参选择器的数据源）。"""
+        filters = ["m.deleted_at IS NULL"]
+        params: List[Any] = []
+        if scope:
+            filters.append("m.scope = ?")
+            params.append(scope)
+        if project_key:
+            filters.append("(m.scope != 'project' OR m.project_key = ?)")
+            params.append(project_key)
+        else:
+            filters.append("m.scope != 'project'")
+        if source_agent:
+            filters.append("v.source_agent = ?")
+            params.append(source_agent)
+        sql = (
+            self._current_select()
+            + " WHERE " + " AND ".join(filters)
+            + " ORDER BY m.updated_at DESC LIMIT ?"
+        )
+        with self.connect() as conn:
+            rows = conn.execute(sql, (*params, limit)).fetchall()
+            return [self._row_to_memory(row) for row in rows]
+
     def changes_since(
         self, cursor: int, project_key: Optional[str], limit: int = 100
     ) -> List[Dict[str, Any]]:
@@ -466,3 +513,114 @@ class BrainStore:
                 item["change_source_agent"] = row["change_source_agent"]
                 result.append(item)
             return result
+
+    # -- 会话目录 -------------------------------------------------------------
+
+    def upsert_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        title: Optional[str],
+        updated_at: str,
+    ) -> Dict[str, Any]:
+        """幂等上报会话元数据。synced_at 保留（客户端上报不得覆盖上传状态）。"""
+        agent_id = agent_id.strip()[:128]
+        session_id = session_id.strip()[:255]
+        if not agent_id or not session_id:
+            raise ValidationError("agent_id and session_id are required")
+        with self.write_transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions(agent_id, session_id, title, updated_at, synced_at, created_at)
+                VALUES (?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(agent_id, session_id) DO UPDATE SET
+                  title = excluded.title,
+                  updated_at = excluded.updated_at
+                """,
+                (agent_id, session_id, (title or "").strip()[:300] or None, updated_at, now_iso()),
+            )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+            return self._row_to_session(row)
+
+    def mark_session_synced(self, agent_id: str, session_id: str) -> Dict[str, Any]:
+        """标记会话已上传（提炼入库后调用）；不存在则创建一条已同步记录。"""
+        agent_id = agent_id.strip()[:128]
+        session_id = session_id.strip()[:255]
+        with self.write_transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM sessions WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+            synced_at = now_iso()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO sessions(agent_id, session_id, title, updated_at, synced_at, created_at)
+                    VALUES (?, ?, NULL, ?, ?, ?)
+                    """,
+                    (agent_id, session_id, synced_at, synced_at, synced_at),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET synced_at = ? WHERE agent_id = ? AND session_id = ?",
+                    (synced_at, agent_id, session_id),
+                )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+            return self._row_to_session(row)
+
+    def list_sessions(
+        self,
+        agent_id: Optional[str] = None,
+        synced: Optional[bool] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        filters: List[str] = []
+        params: List[Any] = []
+        if agent_id:
+            filters.append("agent_id = ?")
+            params.append(agent_id)
+        if synced is not None:
+            filters.append("synced_at IS " + ("NOT NULL" if synced else "NULL"))
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        sql = (
+            "SELECT * FROM sessions" + where
+            + " ORDER BY updated_at DESC LIMIT ?"
+        )
+        with self.connect() as conn:
+            rows = conn.execute(sql, (*params, limit)).fetchall()
+            return [self._row_to_session(row) for row in rows]
+
+    def list_agents(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """distinct agent + 该 agent 的会话数与未上传数（remember 第一级选择用）。"""
+        sql = (
+            "SELECT agent_id, COUNT(*) AS total_count, "
+            "SUM(CASE WHEN synced_at IS NULL THEN 1 ELSE 0 END) AS unsynced_count "
+            "FROM sessions GROUP BY agent_id ORDER BY agent_id LIMIT ?"
+        )
+        with self.connect() as conn:
+            rows = conn.execute(sql, (limit,)).fetchall()
+            return [
+                {
+                    "agent_id": row["agent_id"],
+                    "total_count": int(row["total_count"]),
+                    "unsynced_count": int(row["unsynced_count"] or 0),
+                }
+                for row in rows
+            ]
+
+    @staticmethod
+    def _row_to_session(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "agent_id": row["agent_id"],
+            "session_id": row["session_id"],
+            "title": row["title"],
+            "updated_at": row["updated_at"],
+            "synced_at": row["synced_at"],
+            "created_at": row["created_at"],
+        }

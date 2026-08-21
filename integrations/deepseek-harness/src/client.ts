@@ -15,6 +15,21 @@ export interface MemoryRecord {
   updated_at: string
 }
 
+export interface SessionRecord {
+  agent_id: string
+  session_id: string
+  title: string | null
+  updated_at: string
+  synced_at: string | null
+  created_at: string
+}
+
+export interface AgentSummary {
+  agent_id: string
+  total_count: number
+  unsynced_count: number
+}
+
 export interface PendingOperation {
   opKey: string
   method: 'POST' | 'DELETE'
@@ -147,6 +162,57 @@ export class SharedBrainClient {
       expected_version: expectedVersion,
       source_agent: this.options.agentId,
     })
+  }
+
+  async listMemories(input: {
+    projectKey?: string
+    sourceAgent?: string
+    limit?: number
+  } = {}): Promise<MemoryRecord[]> {
+    const params = new URLSearchParams({
+      project_key: input.projectKey ?? this.options.projectKey,
+      limit: String(input.limit ?? 50),
+    })
+    if (input.sourceAgent) params.set('source_agent', input.sourceAgent)
+    const result = await this.request<{ items: MemoryRecord[] }>('GET', `/v1/memories?${params}`)
+    return result.items
+  }
+
+  async upsertSession(input: {
+    agentId: string
+    sessionId: string
+    title?: string | null
+    updatedAt: string
+  }): Promise<SessionRecord> {
+    return this.request<SessionRecord>('POST', '/v1/sessions', {
+      agent_id: input.agentId,
+      session_id: input.sessionId,
+      title: input.title ?? null,
+      updated_at: input.updatedAt,
+    })
+  }
+
+  async markSessionSynced(agentId: string, sessionId: string): Promise<SessionRecord> {
+    const agent = encodeURIComponent(agentId)
+    const session = encodeURIComponent(sessionId)
+    return this.request<SessionRecord>('POST', `/v1/sessions/${agent}/${session}/synced`)
+  }
+
+  async listSessions(input: {
+    agent?: string
+    synced?: boolean
+    limit?: number
+  } = {}): Promise<SessionRecord[]> {
+    const params = new URLSearchParams({ limit: String(input.limit ?? 100) })
+    if (input.agent) params.set('agent', input.agent)
+    if (input.synced !== undefined) params.set('synced', String(input.synced))
+    const result = await this.request<{ items: SessionRecord[] }>('GET', `/v1/sessions?${params}`)
+    return result.items
+  }
+
+  async listAgents(): Promise<AgentSummary[]> {
+    const result = await this.request<{ items: AgentSummary[] }>('GET', '/v1/sessions/agents')
+    return result.items
   }
 
   async flushQueue(): Promise<{ sent: number; failed: number; remaining: number }> {
