@@ -175,6 +175,8 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 /brain_forget <id> <expected_version>        # tombstone 删除
 ```
 
+命令执行结果会通过 `agent.steer` 以 **plugin notice** 形式**写入会话**（`plugin: shared-brain`），用户可直接在会话中回看；纯 usage 提示不写入避免噪音。注意：写入会话意味着结果进入会话历史，后续轮次的模型上下文可见（有少量 token 成本）。
+
 ---
 
 ## 四、使用示例（CLI）
