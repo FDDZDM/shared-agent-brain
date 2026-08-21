@@ -157,6 +157,15 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 
 插件在**每轮第一步（step 1）前**把召回记忆以 `reference` 引用资料形式注入（在后续指令与用户材料之前），并注册同名 4 个 `brain_*` 工具；断网写入排队到 `.dsh/shared-brain-queue.json`，turn 结束时重放。
 
+**斜杠命令**（结果直接渲染进 UI，不进模型历史、零 token 消耗）：
+
+```text
+/brain_search <query>                        # 搜索共享记忆
+/brain_remember <title> | <content>          # 存一条事实（scope=project）
+/brain_update <id> <expected_version> | <new content>   # 乐观锁更新
+/brain_forget <id> <expected_version>        # tombstone 删除
+```
+
 ---
 
 ## 四、使用示例（CLI）

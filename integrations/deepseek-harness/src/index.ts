@@ -5,11 +5,11 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { renderUntrustedMemories, SharedBrainClient } from './client.js'
+import { renderUntrustedMemories, SharedBrainClient, type MemoryRecord } from './client.js'
 import { JsonOperationQueue } from './queue.js'
 
 export const name = 'shared-brain'
-export const inject = ['tools']
+export const inject = ['commands', 'tools']
 
 export interface Config {
   serverUrl: string
@@ -156,6 +156,119 @@ export function apply(ctx: Context, config: Config): void {
       return JSON.stringify(await client.forget(args.memoryId, args.expectedVersion))
     },
   }))
+
+  // --- 斜杠命令：结果直接渲染进 UI，不进模型历史（零 token 消耗） ---
+  type CommandResult = { kind: 'success' | 'error'; text: string }
+  type CommandInvocation = { rawInput: string; agent?: unknown }
+  const commands = (ctx as unknown as {
+    commands: {
+      register(definition: {
+        name: string
+        description: string
+        input?: { hint: string }
+        handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
+      }): void
+    }
+  }).commands
+  const sessionIdOf = (invocation: CommandInvocation): string | undefined => {
+    const agent = invocation.agent as { session?: { id?: string } } | undefined
+    return agent?.session?.id
+  }
+  const renderResults = (items: MemoryRecord[]): string =>
+    renderUntrustedMemories(items) ?? 'No shared memories matched.'
+
+  commands.register({
+    name: 'brain_search',
+    description: 'search Shared Brain for untrusted reference facts',
+    input: { hint: '<query>' },
+    handler: async (invocation) => {
+      const query = invocation.rawInput.trim()
+      if (!query) return { kind: 'error', text: 'Usage: /brain_search <query>' }
+      try {
+        const items = await client.search(query, recallLimit)
+        return {
+          kind: 'success',
+          text: items.length === 0 ? 'No shared memories matched.' : renderResults(items),
+        }
+      } catch (error) {
+        return { kind: 'error', text: `Shared Brain search failed: ${String(error)}` }
+      }
+    },
+  })
+
+  commands.register({
+    name: 'brain_remember',
+    description: 'save one short durable fact to Shared Brain',
+    input: { hint: '<title> | <content>' },
+    handler: async (invocation) => {
+      const raw = invocation.rawInput.trim()
+      const sep = raw.indexOf('|')
+      const title = (sep === -1 ? raw.slice(0, 80) : raw.slice(0, sep).trim()).trim()
+      const content = sep === -1 ? raw : raw.slice(sep + 1).trim()
+      if (!title || !content) return { kind: 'error', text: 'Usage: /brain_remember <title> | <content>' }
+      try {
+        const rec = await client.remember({
+          title,
+          content,
+          scope: 'project',
+          kind: 'fact',
+          sessionId: sessionIdOf(invocation),
+        })
+        if ('queued' in rec) return { kind: 'success', text: 'Saved to offline queue (will sync when back online).' }
+        return { kind: 'success', text: `Saved v${rec.current_version}: ${rec.title}` }
+      } catch (error) {
+        return { kind: 'error', text: `Shared Brain save failed: ${String(error)}` }
+      }
+    },
+  })
+
+  commands.register({
+    name: 'brain_update',
+    description: 'create a new version of a Shared Brain memory (optimistic lock)',
+    input: { hint: '<memory_id> <expected_version> | <new content>' },
+    handler: async (invocation) => {
+      const raw = invocation.rawInput.trim()
+      const sep = raw.indexOf('|')
+      const head = (sep === -1 ? raw : raw.slice(0, sep)).trim().split(/\s+/)
+      const id = head[0] ?? ''
+      const version = Number(head[1])
+      const content = sep === -1 ? '' : raw.slice(sep + 1).trim()
+      if (!id || !Number.isInteger(version) || version < 1 || !content) {
+        return { kind: 'error', text: 'Usage: /brain_update <memory_id> <expected_version> | <new content>' }
+      }
+      try {
+        const rec = await client.update({
+          memoryId: id,
+          expectedVersion: version,
+          content,
+          sessionId: sessionIdOf(invocation),
+        })
+        if ('queued' in rec) return { kind: 'success', text: 'Queued offline (will sync when back online).' }
+        return { kind: 'success', text: `Updated to v${rec.current_version}: ${rec.title}` }
+      } catch (error) {
+        return { kind: 'error', text: `Shared Brain update failed: ${String(error)}` }
+      }
+    },
+  })
+
+  commands.register({
+    name: 'brain_forget',
+    description: 'tombstone a Shared Brain memory (optimistic lock)',
+    input: { hint: '<memory_id> <expected_version>' },
+    handler: async (invocation) => {
+      const [id, version] = invocation.rawInput.trim().split(/\s+/)
+      const v = Number(version)
+      if (!id || !Number.isInteger(v) || v < 1) {
+        return { kind: 'error', text: 'Usage: /brain_forget <memory_id> <expected_version>' }
+      }
+      try {
+        const res = await client.forget(id, v)
+        return { kind: 'success', text: JSON.stringify(res) }
+      } catch (error) {
+        return { kind: 'error', text: `Shared Brain forget failed: ${String(error)}` }
+      }
+    },
+  })
 
   ctx.on('agent/pre-step', async ({ messages, step, signal }, next): Promise<PreStepDecision> => {
     const downstream = await next()
