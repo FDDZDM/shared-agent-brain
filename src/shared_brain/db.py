@@ -357,7 +357,11 @@ class BrainStore:
 
     @staticmethod
     def _insert_memory_op(
-        conn: sqlite3.Connection, payload: Dict[str, Any], timestamp: str
+        conn: sqlite3.Connection,
+        payload: Dict[str, Any],
+        timestamp: str,
+        *,
+        deduplicate: bool = True,
     ) -> Tuple[int, Dict[str, Any]]:
         """Insert (or dedupe-return) one memory inside an open transaction.
 
@@ -365,16 +369,17 @@ class BrainStore:
         memory write and the session sync marker commit atomically.
         """
         digest = content_hash(payload["title"], payload["content_text"])
-        duplicate = conn.execute(
-            BrainStore._current_select()
-            + " WHERE m.deleted_at IS NULL AND m.scope = ? AND m.kind = ? "
-            + " AND COALESCE(m.project_key, '') = COALESCE(?, '') AND v.content_hash = ? LIMIT 1",
-            (payload["scope"], payload["kind"], payload.get("project_key"), digest),
-        ).fetchone()
-        if duplicate is not None:
-            result = BrainStore._row_to_memory(duplicate)
-            result["deduplicated"] = True
-            return 200, result
+        if deduplicate:
+            duplicate = conn.execute(
+                BrainStore._current_select()
+                + " WHERE m.deleted_at IS NULL AND m.scope = ? AND m.kind = ? "
+                + " AND COALESCE(m.project_key, '') = COALESCE(?, '') AND v.content_hash = ? LIMIT 1",
+                (payload["scope"], payload["kind"], payload.get("project_key"), digest),
+            ).fetchone()
+            if duplicate is not None:
+                result = BrainStore._row_to_memory(duplicate)
+                result["deduplicated"] = True
+                return 200, result
 
         memory_id = str(uuid.uuid4())
         version_id = str(uuid.uuid4())
@@ -540,6 +545,15 @@ class BrainStore:
             conn.execute(
                 "UPDATE memories SET deleted_at = ?, deleted_by_agent = ?, updated_at = ? WHERE id = ?",
                 (timestamp, payload["source_agent"], timestamp, memory_id),
+            )
+            # A deleted session-derived memory must make its source session
+            # selectable again. Keeping a tombstoned link marked as synced
+            # strands the conversation with no visible way to recreate it.
+            conn.execute(
+                "UPDATE sessions SET synced_at = NULL, synced_revision = 0, "
+                "synced_memory_id = NULL, last_sync_error = NULL "
+                "WHERE synced_memory_id = ?",
+                (memory_id,),
             )
             conn.execute(
                 "INSERT INTO memory_change_log(memory_id, action, source_agent, changed_at) VALUES (?, 'delete', ?, ?)",
@@ -787,10 +801,24 @@ class BrainStore:
             raise ValidationError("agent_id and session_id are required")
         with self.write_transaction() as conn:
             existing = conn.execute(
-                "SELECT content_hash FROM sessions "
+                "SELECT content_hash, updated_at, synced_at, created_at FROM sessions "
                 "WHERE project_key = ? AND agent_id = ? AND device_id = ? AND session_id = ?",
                 (project_key, agent_id, device_id, session_id),
             ).fetchone()
+            # Session reports can arrive out of order after reconnect. ISO-8601
+            # UTC timestamps sort chronologically, so an older report must not
+            # roll the directory back or manufacture a false new revision.
+            synthetic_sync_row = (
+                existing is not None
+                and existing["synced_at"] is not None
+                and existing["created_at"] == existing["updated_at"] == existing["synced_at"]
+            )
+            if existing is not None and not synthetic_sync_row and updated_at < existing["updated_at"]:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE project_key = ? AND agent_id = ? AND device_id = ? AND session_id = ?",
+                    (project_key, agent_id, device_id, session_id),
+                ).fetchone()
+                return self._row_to_session(row)
             if existing is not None and content_hash and content_hash != existing["content_hash"]:
                 # 内容在上传后继续变化：content_revision 自增，同步状态回到 changed。
                 conn.execute(
@@ -833,6 +861,8 @@ class BrainStore:
         session_id = session_id.strip()[:255]
         project_key = project_key.strip()[:255]
         device_id = device_id.strip()[:128]
+        if not agent_id or not session_id or not project_key:
+            raise ValidationError("project_key, agent_id and session_id are required")
         with self.write_transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM sessions WHERE project_key = ? AND agent_id = ? AND device_id = ? AND session_id = ?",
@@ -880,6 +910,12 @@ class BrainStore:
         project_key = session_identity.get("project_key", "")
         device_id = session_identity.get("device_id", "")
         content_hash_value = session_identity.get("content_hash")
+        agent_id = agent_id.strip()[:128]
+        session_id = session_id.strip()[:255]
+        project_key = str(project_key).strip()[:255]
+        device_id = str(device_id).strip()[:128]
+        if not agent_id or not session_id or not project_key:
+            raise ValidationError("project_key, agent_id and session_id are required")
         self._validate_scope(memory_payload["scope"], memory_payload.get("project_key"))
         if memory_payload["scope"] != "project":
             raise ValidationError("session sync memory must use scope=project")
@@ -894,10 +930,19 @@ class BrainStore:
         def operation(conn: sqlite3.Connection) -> Tuple[int, Dict[str, Any]]:
             timestamp = now_iso()
             existing = conn.execute(
-                "SELECT content_revision, content_hash, synced_memory_id FROM sessions "
+                "SELECT content_revision, synced_revision, content_hash, synced_memory_id FROM sessions "
                 "WHERE project_key = ? AND agent_id = ? AND device_id = ? AND session_id = ?",
                 (project_key, agent_id, device_id, session_id),
             ).fetchone()
+            if (
+                existing is not None
+                and existing["content_hash"]
+                and content_hash_value
+                and content_hash_value != existing["content_hash"]
+            ):
+                raise ConflictError(
+                    "session content changed while it was being synchronized; refresh and retry"
+                )
             linked_memory_id = existing["synced_memory_id"] if existing is not None else None
             linked_memory = None
             if linked_memory_id:
@@ -906,16 +951,37 @@ class BrainStore:
                     (linked_memory_id,),
                 ).fetchone()
             if linked_memory is not None:
-                status, memory_result = BrainStore._append_memory_version_op(
-                    conn,
-                    linked_memory_id,
-                    memory_payload,
-                    timestamp,
+                unchanged = (
+                    existing is not None
+                    and existing["content_hash"] == content_hash_value
+                    and int(existing["synced_revision"]) >= int(existing["content_revision"])
+                    and linked_memory["title"] == memory_payload["title"].strip()
+                    and linked_memory["content_text"] == memory_payload["content_text"].strip()
+                    and linked_memory["kind"] == memory_payload["kind"]
+                    and int(linked_memory["trust_level"]) == int(memory_payload.get("trust_level", 0))
                 )
+                if unchanged:
+                    status = 200
+                    memory_result = BrainStore._row_to_memory(linked_memory)
+                    memory_result["deduplicated"] = True
+                else:
+                    status, memory_result = BrainStore._append_memory_version_op(
+                        conn,
+                        linked_memory_id,
+                        memory_payload,
+                        timestamp,
+                    )
             else:
                 # First sync, or the previously linked memory was tombstoned:
-                # create a new durable record and relink the session.
-                status, memory_result = BrainStore._insert_memory_op(conn, memory_payload, timestamp)
+                # create a new durable record and relink the session. Session
+                # memories never content-dedupe across identities/devices,
+                # because every linked record is independently mutable.
+                status, memory_result = BrainStore._insert_memory_op(
+                    conn,
+                    memory_payload,
+                    timestamp,
+                    deduplicate=False,
+                )
 
             content_revision = int(existing["content_revision"]) if existing is not None else 0
             if content_hash_value and (existing is None or content_hash_value != existing["content_hash"]):
@@ -932,11 +998,9 @@ class BrainStore:
             else:
                 conn.execute(
                     "UPDATE sessions SET content_revision = ?, content_hash = ?, "
-                    "synced_at = ?, synced_revision = ?, synced_memory_id = ?, last_sync_error = NULL, "
-                    "title = ?, updated_at = ? "
+                    "synced_at = ?, synced_revision = ?, synced_memory_id = ?, last_sync_error = NULL "
                     "WHERE project_key = ? AND agent_id = ? AND device_id = ? AND session_id = ?",
                     (content_revision, content_hash_value, timestamp, content_revision, memory_result["id"],
-                     (memory_payload.get("title") or "").strip()[:300] or None, timestamp,
                      project_key, agent_id, device_id, session_id),
                 )
             row = conn.execute(

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class MemoryScope(str, Enum):
@@ -68,6 +69,19 @@ class SessionCreate(MemoryModel):
     title: Optional[str] = Field(default=None, max_length=300)
     updated_at: str = Field(min_length=1, max_length=64)
     content_hash: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("updated_at")
+    @classmethod
+    def normalize_updated_at(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("updated_at must be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("updated_at must include a timezone")
+        return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
 
 
 class SessionSync(MemoryModel):

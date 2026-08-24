@@ -2,7 +2,7 @@
 
 > 面向开放 Agent Harness 的**零 LLM、可自托管**共享记忆与 Skill 后端。
 > 首发原生支持 Hermes（Python MemoryProvider）与 DeepSeek Harness（Cordis 插件）。
-> 本文档基于源码静态分析生成，对应版本 `0.1.0`（Phase 1 MVP）。
+> 本文档基于源码静态分析生成，对应版本 `0.1.0`（Phase 1 MVP），状态机审计更新于 2026-08-24。
 
 ## 1. 项目概览
 
@@ -17,7 +17,7 @@
 
 ### 1.1 核心设计取舍
 
-- **原生扩展点而非目录嗅探**：Hermes 走 `MemoryProvider` ABC + entry point；DeepSeek 走 Cordis 插件 + `ctx.tools`。不猜测平台内部存储格式。
+- **原生扩展点优先**：Hermes 走 `MemoryProvider` ABC/插件目录发现；DeepSeek 走 Cordis 插件 + `ctx.tools`。会话 remember 只通过各自本机可读的会话接口提取文本，不跨 agent 猜测远端存储。
 - **CLI 降级为工具**：`amm` 只做配置 / 诊断 / 人工维护，不承载运行时 I/O。
 - **Memory = 不可信引用数据，Skill = 可执行指令**：注入层强制分界，召回内容永远不提升为系统指令。
 - **服务器零 LLM**：只存 / 查 / 搜，弱机（树莓派级）可跑。
@@ -51,7 +51,7 @@
 2. 客户端生成 `Idempotency-Key`，`POST /v1/memories`
 3. 服务器 `authenticate()` 校验 Bearer token → `BrainStore.create_memory(payload, op_key, req_hash)`
 4. `_idempotent()` 在 `BEGIN IMMEDIATE` 事务内：查 `applied_ops` 去重 → 内容哈希去重 → 插 `memories` + `memory_versions` + `memory_change_log` → 写 `applied_ops`
-5. 网络断开时客户端捕获 `httpx.TransportError`，写入本地 `OfflineQueue`，后续 `flush_queue()` 用**同一幂等键**重放
+5. 网络断开时客户端捕获 `httpx.TransportError`，写入本地 `OfflineQueue`，后续 `flush_queue()` 用**同一幂等键**重放；仅 transport/5xx 自动重试，409/其他 4xx 进入 failed，刷新业务状态后才能显式重试
 
 **召回路径**（以 DeepSeek 每轮前注入为例）：
 1. `ctx.on('agent/pre-step')` 在 `step === 1` 提取用户文本 → `client.search(query, recallLimit)`

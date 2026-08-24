@@ -131,3 +131,18 @@ test('flushQueue dead-letters permanent 4xx and continues with later operations'
   assert.deepEqual(await client.flushQueue(), { sent: 1, failed: 1, remaining: 1 })
   assert.equal(queue.list()[0].status, 'failed')
 })
+
+test('flushQueue dead-letters optimistic-lock conflicts instead of retrying stale state', async () => {
+  const queue = new JsonOperationQueue(join(mkdtempSync(join(tmpdir(), 'shared-brain-dsh-')), 'queue.json'))
+  queue.enqueue({ opKey: 'conflict', method: 'POST', path: '/conflict', payload: {}, attempts: 0 })
+  const client = new SharedBrainClient({
+    serverUrl: 'https://brain.invalid', token: 'token', agentId: 'dsh', projectKey: 'alpha', queue,
+    fetch: async () => new Response(JSON.stringify({ error: 'stale version' }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    }),
+  })
+
+  assert.deepEqual(await client.flushQueue(), { sent: 0, failed: 1, remaining: 1 })
+  assert.equal(queue.list()[0].status, 'failed')
+})

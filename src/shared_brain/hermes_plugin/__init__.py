@@ -25,6 +25,41 @@ from shared_brain.selftest import run_selftest
 PROVIDER_NAME = "shared-brain"
 
 
+def _hermes_state_db() -> Path:
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    return home / "state.db"
+
+
+def _read_hermes_session_title(session_id: str) -> str:
+    """Read Hermes' own Agent-generated title; tolerate older DB schemas."""
+    db_path = _hermes_state_db()
+    if not db_path.exists():
+        return ""
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return str(row[0]).strip()[:300] if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _conversation_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Keep only human-visible dialogue for titles and change detection.
+
+    Tool traces, system prompts and recalled Shared Brain context are runtime
+    plumbing. Including them makes a session look changed when no user/agent
+    conversation changed, and can later leak that plumbing into remember.
+    """
+    normalized: List[Dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role") or "").lower()
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str) or not content.strip():
+            continue
+        normalized.append({"role": role, "content": content.strip()})
+    return normalized
+
+
 class SharedBrainMemoryProvider(MemoryProvider):
     """Recall shared facts and expose explicit, version-safe write tools."""
 
@@ -245,14 +280,18 @@ class SharedBrainMemoryProvider(MemoryProvider):
         if self._client is None or not self._session_id:
             return
         try:
-            title = ""
-            for message in messages:
-                content = message.get("content", "")
-                if message.get("role") == "user" and isinstance(content, str) and content.strip():
-                    title = content.strip()[:80]
-                    break
+            conversation = _conversation_messages(messages)
+            if not conversation:
+                return
+            title = _read_hermes_session_title(self._session_id)
+            if not title:
+                for message in conversation:
+                    content = message.get("content", "")
+                    if message.get("role") == "user" and isinstance(content, str) and content.strip():
+                        title = content.strip()[:80]
+                        break
             content_fingerprint = hashlib.sha256(
-                json.dumps(messages, ensure_ascii=False).encode("utf-8")
+                json.dumps(conversation, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             ).hexdigest()[:32]
             self._client.upsert_session(
                 str(self._config.get("agent_id") or "hermes"),
@@ -278,8 +317,7 @@ class SharedBrainMemoryProvider(MemoryProvider):
 
 def _read_hermes_session_text(session_id: str, limit_chars: int = 8000) -> str:
     """从 Hermes state.db 只读提取会话消息文本（remember 上传的内容源）。"""
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    db_path = home / "state.db"
+    db_path = _hermes_state_db()
     if not db_path.exists():
         return ""
     try:
@@ -300,10 +338,11 @@ def _read_hermes_session_text(session_id: str, limit_chars: int = 8000) -> str:
         return ""
     parts = []
     for _, role, content in rows:
-        if not content:
+        normalized_role = str(role or "").lower()
+        if normalized_role not in {"user", "assistant"} or not content:
             continue
         text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-        parts.append(f"{role}: {text[:400]}")
+        parts.append(f"{normalized_role}: {text[:400]}")
     transcript = "\n".join(parts)
     if len(transcript) <= limit_chars:
         return transcript
@@ -425,7 +464,12 @@ def _slash_commands() -> List[tuple]:
             if not args:
                 # 无参：列待同步会话（首次未上传或同步后内容已变化）
                 try:
-                    sessions = client.list_sessions(synced=False, device_id=client.device_id, limit=100)
+                    sessions = client.list_sessions(
+                        agent=client.agent_id,
+                        synced=False,
+                        device_id=client.device_id,
+                        limit=100,
+                    )
                     if not sessions:
                         return (
                             "没有待同步的会话（新会话或同步后继续对话的会话，会在结束时自动进入列表）。\n"
@@ -433,12 +477,12 @@ def _slash_commands() -> List[tuple]:
                         )
                     lines = [
                         "待同步的会话（输入 /brain remember <编号> <标题> 同步；"
-                        "Hermes 端上传原始会话文本、不做提炼）:"
+                        "Hermes 端上传净化后的用户/助手对话文本，不做提炼）:"
                     ]
                     for i, s in enumerate(sessions, 1):
                         lines.append(
                             f"  {i}. [{s['agent_id']}] {s['title'] or s['session_id'][:12]}"
-                            f"（{s['updated_at'][:16]}）"
+                            f"（生成 {s['created_at'][:16]} · 最近修改 {s['updated_at'][:16]}）"
                         )
                     return "\n".join(lines)
                 except Exception as exc:
@@ -448,7 +492,12 @@ def _slash_commands() -> List[tuple]:
                 if parts and parts[0].isdigit():
                     # 编号 + 标题：从服务器目录取会话 → 读本机会话文本 → 上传
                     try:
-                        sessions = client.list_sessions(synced=False, device_id=client.device_id, limit=100)
+                        sessions = client.list_sessions(
+                            agent=client.agent_id,
+                            synced=False,
+                            device_id=client.device_id,
+                            limit=100,
+                        )
                         idx = int(parts[0]) - 1
                         if idx < 0 or idx >= len(sessions):
                             return f"编号越界（共 {len(sessions)} 个待同步会话）"

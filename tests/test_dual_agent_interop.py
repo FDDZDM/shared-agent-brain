@@ -300,6 +300,6 @@ def test_live_selftest_t11_checks_deleted_id_not_total_hits(live_brain, tmp_path
     finally:
         client.close()
     t11 = next(result for result in report["results"] if result["id"] == "T11")
-    assert t11["status"] == "pass"
+    assert t11["status"] == "pass", report["text"]
     assert "目标已隐藏" in t11["detail"]
     assert "另有 1 条同批次命中" in t11["detail"]

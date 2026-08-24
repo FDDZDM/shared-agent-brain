@@ -612,7 +612,7 @@ test('forget failures render in the session and never become model input', async
   assert.deepEqual(decision, { kind: 'reject' })
 })
 
-test('setup validates the runtime and hot-reloads the plugin after replying', async t => {
+test('setup validates the runtime and reloads the plugin lifecycle after replying', async t => {
   const server = fakeServer()
   const originalFetch = globalThis.fetch
   globalThis.fetch = server.fetchImpl
@@ -623,7 +623,7 @@ test('setup validates the runtime and hot-reloads the plugin after replying', as
   const result = await run('setup')
   assert.equal(result.kind, 'success')
   assert.equal(result.text, '')
-  assert.match(steered.at(-1).content[0].text, /热重载/)
+  assert.match(steered.at(-1).content[0].text, /插件生命周期.*重新加载/)
   assert.equal(restartCount(), 0, 'reload must not dispose the command before it replies')
   await new Promise(resolve => setTimeout(resolve, 10))
   assert.equal(restartCount(), 1)

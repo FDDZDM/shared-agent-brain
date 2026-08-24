@@ -8,7 +8,7 @@ Phase 1 已实现：
 - 版本化 `global` / `user` / `project` 三种 scope 的记忆，项目隔离。
 - SQLite **FTS5 trigram** 全文检索（中英混排，`content_text` 内联存储 + 触发器同步）。
 - **乐观锁**（`expected_version` 不符 → HTTP 409）、**tombstone 删除**、增量变更流。
-- 幂等键（`Idempotency-Key`）与**离线客户端队列**（断网排队、恢复幂等重试）。
+- 幂等键（`Idempotency-Key`）与**离线客户端队列**（断网/5xx 自动重试；409/其他 4xx 留作诊断，修正状态后显式重试）。
 - 召回注入自带**不可信数据边界**（`untrusted-reference-data` 标记，记忆只作引用、永不提升为系统指令）。
 - Hermes `MemoryProvider` 插件 + DeepSeek Harness Cordis 插件（各含 4 个 `brain_*` 工具）。
 
@@ -132,21 +132,23 @@ hermes memory status   # Provider: shared-brain / available ✓
 /brain update [<id> <expected_version> | <new content>]   # 无参=选记忆后输入新内容
 /brain forget [<id> <expected_version>]      # 无参=选记忆后确认删除
 /brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
-/brain setup                                 # 校验配置和队列；DSH 热重载插件
+/brain setup                                 # 校验配置、重放队列并重新加载插件生命周期
 /brain help                                  # 命令说明书
 ```
 
 与 DSH 端完全同构（单一 `/brain` + 子命令，子命令与 `brain_*` 工具一一对应，命令面与工具面不撞名）。
 
-**交互设计（v2，列表选择优先）**：无参调用不再要求手输，而是**从服务器拉候选列表让用户选择**——
-`remember` 先列 agent（init 时配置的 agent name，如 `Mac-Hermes`）→ 列该 agent 的**待同步会话**
+**交互设计（v2，列表选择优先）**：无参调用不再要求手输，而是**从服务器拉候选列表让用户选择**。
+`/brain` 浏览入口和 `update`/`forget` 可以跨 agent 管理共享内容；`remember` 只列当前客户端所属 agent
+在本机可读取的**待同步会话**，不会先让用户选到另一个 agent、随后才因读不到 transcript 而失败。
+待同步会话包括
 （首次未同步，或同步后继续产生了新对话）→
 显示当前会话 Agent 生成的标题以及创建时间、最近修改时间 → 保存前允许用户沿用或自定义标题 →
 DSH 端由模型自动提炼会话内容入库；`update`/`forget` 按 agent 分组列记忆后选择；
 `search` 无参浏览最近记忆。会话目录（agent → 会话）由各客户端在会话结束时自动上报到服务器
 （Hermes 用 `on_session_end`；DSH 同时监听 `turn/end` 和标题生成后的 `session/title`，并在打开
 `remember` 列表时从本地会话日志修复旧的空标题；列表不再以 session id 充当标题）。平台差异：DSH 端有弹窗选择 +
-LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题>`），上传原始会话文本（未提炼）。
+LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题>`），上传经净化的用户/助手对话文本（未提炼，排除 system、tool 与召回上下文）。
 
 **提炼方式**：DSH 插件复用当前 Agent 已选择的 provider/model 发起一次**隔离模型调用**，
 输入只包含用户选中的源会话，不携带当前聊天历史，也不触发 Shared Brain 自动召回。源会话中仅保留
@@ -155,7 +157,8 @@ LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题
 插件直接执行复合会话同步。无需配置额外 agent 或 `summarizeModel`，服务器仍保持零 LLM。
 首次同步创建记忆 v1；原会话后续内容指纹变化时状态转为 `changed`，再次执行 `remember` 会沿
 `synced_memory_id` 原子追加 v2、v3……，不会创建重复记忆。长会话采用“开头 + 最新内容”窗口，
-避免超过长度预算后新增对话无法触发变更。
+避免超过长度预算后新增对话无法触发变更。不同会话即使摘要文字完全相同，也不会共享同一个可变记忆；
+删除会话关联的记忆后，该会话会重新回到待同步列表。
 
 ---
 
@@ -199,13 +202,13 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 /brain update <id> <expected_version> | <new content>   # 乐观锁更新
 /brain forget <id> <expected_version>        # tombstone 删除
 /brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
-/brain setup                                 # 校验配置和队列；DSH 热重载插件
+/brain setup                                 # 校验配置和队列；重新加载插件生命周期
 /brain help                                  # 命令说明书
 ```
 
-`/brain setup` 会先重放可执行的离线队列。DSH 端随后通过 Cordis fiber 热重载当前插件，
-无需退出整个桌面应用；Hermes 当前没有对应的插件热重载生命周期，因此会完成配置校验并明确提示重启。
-注意：首次安装包含 `setup` 的新版本时，旧进程尚未注册该命令，仍需重启一次；之后即可直接使用。
+`/brain setup` 会先重放可执行的离线队列。DSH 端随后重启 Cordis 插件生命周期，适合应用已加载版本的
+重新配置；刚替换 `lib/` 代码或首次安装包含 `setup` 的版本时，仍需重启 DSH Desktop 才能保证载入新模块。
+Hermes 当前没有对应生命周期，因此完成配置校验后会明确提示重启。
 
 只有 `/brain help` 显示说明书；`/brain`（无参）进入 agent → 会话/记忆的列表选择。DSH 的说明书、成功通知、错误回执和用法提示都会作为 plugin notice 写入会话；注入成功后命令返回空 success，避免终端重复输出，同时 `agent/pre-step` 会拒绝由该 notice 单独唤起的模型步骤，因此 Agent 不会再对 “forget failed” 或 “Saved v1” 作二次解释和追问。只有会话注入接口不可用时才降级到终端。Hermes 缺少对应的 pre-step 拦截能力，所以全部命令结果直接返回，禁止使用会唤醒模型的 `inject_message(role=user)`。平台有原生选项选择器时优先使用，不要求用户读取终端输出后手输编号。
 
@@ -273,6 +276,8 @@ Hermes → DSH、DSH → Hermes 双向写读、复合会话同步和并发更新
 4. DSH 会话 `brain_search`/`brain_remember` 可用，step 1 前自动注入引用资料。
 5. 两端写同一 `project_key` 的记忆互相可见。
 6. 两端并发更新同一版本时恰好一端成功，另一端收到 409，且最终版本两端一致。
+7. 在已 remember 的源会话继续对话后，它重新出现在待同步列表；再次 remember 更新同一 memory id 的下一版本。
+8. 分别在 DSH 与 Hermes 执行命令，成功/失败回执只出现在会话窗口，不被 Agent 当作新用户请求继续回答。
 
 ---
 
@@ -286,6 +291,8 @@ Hermes → DSH、DSH → Hermes 双向写读、复合会话同步和并发更新
 | Hermes provider 不出现 | 发现机制是**目录扫描**（`$HERMES_HOME/plugins/<name>/`），不是 entry point |
 | DSH 插件不生效 | `cordis.yml` 每次启动被重写 → 必须写 `cordis.patch.yml` 的 `insert` 层 |
 | DSH 启动报 token 缺失 | GUI 无环境变量 → 用 `config.token` 字段而非 `tokenEnv` |
+| Hermes 请求莫名 502、DSH 却正常 | Python/Hermes 客户端默认不继承 `HTTP_PROXY`/`HTTPS_PROXY`，与 DSH 的直连行为保持一致；需要代理时请在服务 URL 前配置明确的反向代理，而不是依赖宿主环境变量 |
+| 离线队列里 409 一直失败 | 409 是版本/幂等冲突，重复发送旧请求不会自愈；刷新目标版本或会话状态后，用 `amm queue retry <op_key>` 显式重试，或删除已确认无效的队列项 |
 | 本地 pytest 撞 Hermes 依赖 | Hermes 注入的 `PYTHONPATH` 遮蔽项目依赖 → `unset PYTHONPATH` + `source .venv/bin/activate` |
 | `docker compose up` 被守护误判为常驻进程 | 后台执行（`background=true`） |
 | 重启 docker 打断其他容器 | 先查 RestartPolicy（`always` 会自动恢复） |

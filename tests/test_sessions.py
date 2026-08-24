@@ -90,6 +90,30 @@ def test_upsert_is_idempotent_and_keeps_synced(api, auth_headers):
     assert r.json()["count"] == 1
 
 
+def test_late_session_report_cannot_roll_back_newer_metadata(api, auth_headers):
+    newer = {
+        "project_key": "alpha", "agent_id": "Mac-Hermes", "device_id": "mac-a",
+        "session_id": "sess-1", "title": "新标题",
+        "updated_at": "2026-08-21T11:00:00Z", "content_hash": "new-hash",
+    }
+    older = {**newer, "title": "旧标题", "updated_at": "2026-08-21T10:00:00Z", "content_hash": "old-hash"}
+    assert api.post("/v1/sessions", headers=auth_headers, json=newer).status_code == 200
+    result = api.post("/v1/sessions", headers=auth_headers, json=older)
+
+    assert result.status_code == 200
+    assert result.json()["title"] == "新标题"
+    assert result.json()["content_hash"] == "new-hash"
+    assert result.json()["content_revision"] == 1
+
+
+def test_session_timestamp_requires_timezone_and_is_normalized(api, auth_headers):
+    invalid = _upsert(api, auth_headers, "Mac-Hermes", "sess-1", "标题", "2026-08-21 10:00:00")
+    assert invalid.status_code == 422
+    valid = _upsert(api, auth_headers, "Mac-Hermes", "sess-1", "标题", "2026-08-21T18:00:00+08:00")
+    assert valid.status_code == 200
+    assert valid.json()["updated_at"] == "2026-08-21T10:00:00.000000Z"
+
+
 def test_mark_synced_creates_record_if_absent(api, auth_headers):
     r = _synced(api, auth_headers, "Mac-DSH", "ghost-session")
     assert r.status_code == 200

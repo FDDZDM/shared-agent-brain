@@ -70,8 +70,8 @@ def test_retry_and_remove_management(tmp_path):
     assert queue.remove(op_key) is False
 
 
-def test_flush_409_does_not_block_the_rest_of_the_queue(tmp_path):
-    """409 conflict on item 1 must not prevent item 2 from being replayed."""
+def test_flush_409_is_dead_lettered_and_does_not_block_the_rest(tmp_path):
+    """A stale 409 cannot self-heal, but must not prevent item 2 replay."""
     queue = OfflineQueue(str(tmp_path / "queue.db"))
     queue.enqueue("POST", "/v1/memories", {"title": "first"}, op_key="op-conflict-1")
     queue.enqueue("POST", "/v1/memories", {"title": "second"}, op_key="op-second-01")
@@ -89,11 +89,11 @@ def test_flush_409_does_not_block_the_rest_of_the_queue(tmp_path):
     client.close()
 
     assert result == {"sent": 1, "failed": 1, "remaining": 1}
-    # 第二个任务成功发出；冲突任务仍在队列中（可重试，未永久失败）
+    # 第二个任务成功发出；冲突任务保留作诊断，但不再自动重试。
     assert len(seen) == 2
     remaining = queue.list()
     assert remaining[0]["op_key"] == "op-conflict-1"
-    assert remaining[0]["status"] == "pending"
+    assert remaining[0]["status"] == "failed"
     assert remaining[0]["attempts"] == 1
 
 

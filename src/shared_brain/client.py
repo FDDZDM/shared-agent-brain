@@ -30,6 +30,7 @@ class SharedBrainClient:
         timeout: float = 5.0,
         transport: Optional[httpx.BaseTransport] = None,
         device_id: str = "",
+        trust_env: bool = False,
     ):
         self.server_url = server_url.rstrip("/")
         self.token = token
@@ -44,6 +45,7 @@ class SharedBrainClient:
             timeout=timeout,
             headers={"Authorization": f"Bearer {token}"},
             transport=transport,
+            trust_env=trust_env,
         )
 
     def close(self) -> None:
@@ -307,8 +309,8 @@ class SharedBrainClient:
         Error handling:
         - transport errors  -> retryable, keep FIFO order, stop this pass
         - 5xx               -> retryable, stop this pass (server trouble)
-        - 409 conflicts     -> retryable but must NOT block the rest of the
-                               queue; task keeps retrying until max_attempts
+        - 409 conflicts     -> non-retryable; the user must refresh the stale
+                               version/session and explicitly retry
         - other 4xx         -> non-retryable (permanent) failure, skip
         """
         sent = 0
@@ -327,12 +329,12 @@ class SharedBrainClient:
                 failed += 1
                 break
             except BrainClientError as exc:
-                retryable = exc.status is None or exc.status >= 500 or exc.status == 409
+                retryable = exc.status is None or exc.status >= 500
                 self.queue.mark_failed(item["op_key"], str(exc), retryable=retryable)
                 failed += 1
-                if retryable and exc.status != 409:
+                if retryable:
                     break
-                # 409 / 非重试错误：不阻塞队列中的后续任务
+                # Permanent client/conflict errors do not block later tasks.
             else:
                 self.queue.remove(item["op_key"])
                 sent += 1

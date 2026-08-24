@@ -85,6 +85,7 @@ export function apply(ctx: Context, config: Config): void {
     timeoutMs: config.requestTimeoutMs ?? 5_000,
   })
   const recallLimit = config.recallLimit ?? 5
+  const localAgentId = config.agentId ?? 'deepseek-harness'
   type LlmService = {
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>
   }
@@ -504,7 +505,7 @@ export function apply(ctx: Context, config: Config): void {
     '| `/brain update [<id> <expected_version> \\| <new content>]` | 无参=选记忆后输入新内容 |',
     '| `/brain forget [<id> <expected_version>]` | 无参=选记忆后确认删除 |',
     '| `/brain test [quick]` | 运行全链路自检并显示报告 |',
-    '| `/brain setup` | 校验当前配置并热重载 Shared Brain 插件 |',
+    '| `/brain setup` | 校验配置、重放队列并重新加载插件生命周期 |',
     '| `/brain help` | 显示本说明书 |',
   ].join('\n')
 
@@ -613,17 +614,13 @@ export function apply(ctx: Context, config: Config): void {
         }
         case 'remember': {
           if (!args) {
-            // 无参：选 agent → 选待同步会话 → 设标题 → 首次创建或更新原记忆
+            // Only the current agent can read its local transcript store.
+            // Cross-agent memories remain browsable/manageable, but remember
+            // must not offer an unreadable remote agent session.
             try {
-              const agent = await pickAgent(invocation)
-              if (!agent) {
-                const text = '没有待同步的会话（新会话或已同步后继续对话的会话，会在轮次结束时自动进入列表）。'
-                return commandResult('success', text)
-              }
-              if (!agent.agent_id) return noSelection()
-              const session = await pickUnsyncedSession(invocation, agent.agent_id)
+              const session = await pickUnsyncedSession(invocation, localAgentId)
               if (!session) {
-                const text = `${agent.agent_id} 没有待同步的会话。`
+                const text = `没有待同步的会话（仅显示 ${localAgentId} 可读取的本机会话）。新会话或同步后继续对话的会话会自动进入列表。`
                 return commandResult('success', text)
               }
               // 标题：用户手动设置（可自由输入，或用会话原标题）
@@ -653,7 +650,7 @@ export function apply(ctx: Context, config: Config): void {
                 conversation,
               )
               const synced = await client.syncSession({
-                agentId: agent.agent_id,
+                agentId: localAgentId,
                 sessionId: session.session_id,
                 title,
                 content: summary,
@@ -830,7 +827,7 @@ export function apply(ctx: Context, config: Config): void {
             }, 0)
             return commandResult(
               'success',
-              'Shared Brain 配置与离线队列已校验；插件将在本条命令返回后热重载。',
+              'Shared Brain 配置与离线队列已校验；插件生命周期将在本条命令返回后重新加载。替换过插件代码时仍需重启 DSH Desktop。',
             )
           } catch (error) {
             return commandResult('error', `Shared Brain setup failed: ${String(error)}`)

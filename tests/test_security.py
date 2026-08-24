@@ -20,6 +20,7 @@ def test_untrusted_memory_is_escaped_and_framed_as_data():
     assert "<system>" not in rendered
     assert "</memory>\n</memory>" not in rendered
     assert "&lt;system&gt;" in rendered
+    assert '<memory metadata="{' in rendered
 
 
 def test_render_budget_truncates_long_recalls():
@@ -81,4 +82,3 @@ def test_render_budget_can_be_raised_explicitly():
     ]
     rendered = render_untrusted_memories(memories, max_chars=20_000)
     assert "x" * 8000 in rendered
-

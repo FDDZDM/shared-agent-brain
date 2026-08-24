@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
 import pytest
 
@@ -186,3 +187,56 @@ def test_tool_result_is_structured_json_not_free_text(monkeypatch):
     parsed = json.loads(raw)
     assert isinstance(parsed, list)
     assert parsed[0]["title"] == "PostgreSQL 16"
+
+
+def test_session_fingerprint_ignores_system_and_tool_plumbing():
+    base = [
+        {"role": "system", "content": "runtime prompt"},
+        {"role": "user", "content": " 真实问题 "},
+        {"role": "assistant", "content": "真实回答"},
+        {"role": "tool", "content": "large tool trace"},
+    ]
+    changed_plumbing = [
+        {"role": "system", "content": "different recalled shared memory"},
+        base[1], base[2],
+        {"role": "tool", "content": "different trace"},
+    ]
+    assert hermes_plugin._conversation_messages(base) == hermes_plugin._conversation_messages(changed_plumbing)
+
+
+def test_hermes_transcript_reader_excludes_system_and_tool_rows(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT)")
+        conn.executemany(
+            "INSERT INTO messages(session_id, role, content) VALUES ('s1', ?, ?)",
+            [
+                ("system", "shared-memory-context secret plumbing"),
+                ("user", "当前会话问题"),
+                ("tool", "terminal output"),
+                ("assistant", "当前会话回答"),
+            ],
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    transcript = hermes_plugin._read_hermes_session_text("s1")
+
+    assert "当前会话问题" in transcript
+    assert "当前会话回答" in transcript
+    assert "shared-memory-context" not in transcript
+    assert "terminal output" not in transcript
+
+
+def test_hermes_uses_its_agent_generated_session_title(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT, title_source TEXT)")
+        conn.execute(
+            "INSERT INTO sessions(id, title, title_source) VALUES (?, ?, ?)",
+            ("s1", "Agent 生成的 PostgreSQL 升级方案", "model"),
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert hermes_plugin._read_hermes_session_title("s1") == "Agent 生成的 PostgreSQL 升级方案"

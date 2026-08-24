@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import json
+import stat
+from typing import Optional
 
 import pytest
 
 from shared_brain.cli import main
+from shared_brain.config import load_config, save_config
 from shared_brain.queue import OfflineQueue
-from typing import Optional
 
 TOKEN = "token-that-is-long-enough-123456"
+
+
+def test_config_is_atomically_saved_with_private_permissions(tmp_path):
+    target = tmp_path / "private" / "config.json"
+    saved = save_config({"token": TOKEN, "agent_id": "hermes"}, str(target))
+    assert load_config(str(saved))["token"] == TOKEN
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+    assert not saved.with_suffix(".tmp").exists()
 
 
 def _config(tmp_path, queue_path=None):

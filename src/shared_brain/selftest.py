@@ -99,7 +99,10 @@ def run_selftest(client: SharedBrainClient, quick: bool = False) -> Dict[str, An
         return created[0] if created else None
 
     # T1/T2/T9 需要不带 Authorization 的裸请求（T2 本身就要验证 401）。
-    bare = httpx.Client(timeout=5.0)
+    # Diagnostics must test the configured server itself. Environment proxy
+    # variables can route even loopback probes through a corporate proxy and
+    # turn a healthy local server into a misleading HTTP 502.
+    bare = httpx.Client(timeout=5.0, trust_env=False)
     try:
         def t1() -> Tuple[bool, str]:
             response = bare.get(f"{base}/health")

@@ -288,10 +288,13 @@ export class SharedBrainClient {
         sent += 1
       } catch (error) {
         const status = error instanceof BrainHttpError ? error.status : undefined
-        const retryable = status === undefined || status >= 500 || status === 409
+        // A 409 is an optimistic-lock/idempotency conflict. Replaying the
+        // identical stale operation cannot heal it; require an explicit retry
+        // based on freshly loaded state instead of burning ten attempts.
+        const retryable = status === undefined || status >= 500
         this.options.queue.fail(operation.opKey, String(error), retryable)
         failed += 1
-        if (retryable && status !== 409) break
+        if (retryable) break
       }
     }
     return { sent, failed, remaining: this.options.queue.list().length }

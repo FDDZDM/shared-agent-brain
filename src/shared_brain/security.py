@@ -72,7 +72,8 @@ def _render_memory(item: Mapping[str, Any]) -> str:
         "source_agent": item.get("source_agent"),
         "trust_level": item.get("trust_level", 0),
     }
-    lines = [f"<memory metadata={html.escape(json.dumps(metadata, ensure_ascii=False))}>"]
+    escaped_metadata = html.escape(json.dumps(metadata, ensure_ascii=False), quote=True)
+    lines = [f'<memory metadata="{escaped_metadata}">']
     lines.append(f"<title>{html.escape(str(item.get('title', '')))}</title>")
     lines.append(f"<content>{html.escape(str(item.get('content_text', '')))}</content>")
     lines.append("</memory>")

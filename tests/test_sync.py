@@ -94,6 +94,23 @@ def test_compound_sync_replay_is_idempotent(api, auth_headers):
     assert found["count"] == 1
 
 
+def test_same_sync_with_a_new_operation_key_is_a_business_noop(api, auth_headers):
+    first = api.post(
+        "/v1/sessions/Mac-Hermes/sess-1/sync",
+        json=_sync_body(),
+        headers=op(auth_headers, "sync-business-noop-1"),
+    ).json()
+    second = api.post(
+        "/v1/sessions/Mac-Hermes/sess-1/sync",
+        json=_sync_body(),
+        headers=op(auth_headers, "sync-business-noop-2"),
+    )
+    assert second.status_code == 200
+    assert second.json()["memory"]["id"] == first["memory"]["id"]
+    assert second.json()["memory"]["current_version"] == 1
+    assert second.json()["memory"]["deduplicated"] is True
+
+
 def test_changed_session_sync_updates_the_linked_memory_version(api, auth_headers):
     first = api.post(
         "/v1/sessions/Mac-Hermes/sess-1/sync",
@@ -145,6 +162,88 @@ def test_changed_session_sync_updates_the_linked_memory_version(api, auth_header
         params={"project_key": "alpha"},
     ).json()["items"]
     assert len(memories) == 1
+
+
+def test_equal_summaries_from_different_sessions_do_not_share_mutable_memory(api, auth_headers):
+    first = api.post(
+        "/v1/sessions/hermes/sess-1/sync",
+        json=_sync_body(),
+        headers=op(auth_headers, "sync-distinct-session-1"),
+    ).json()
+    second_body = _sync_body()
+    second_body["memory"]["source_session_id"] = "sess-2"
+    second = api.post(
+        "/v1/sessions/hermes/sess-2/sync",
+        json=second_body,
+        headers=op(auth_headers, "sync-distinct-session-2"),
+    ).json()
+
+    assert first["memory"]["id"] != second["memory"]["id"]
+
+    _upsert(api, auth_headers, "hermes", "sess-2", "数据库版本", "2026-08-21T11:00:00Z", "h2")
+    second_body["content_hash"] = "h2"
+    second_body["memory"]["content_text"] = "仅第二个会话升级到 PostgreSQL 17。"
+    updated = api.post(
+        "/v1/sessions/hermes/sess-2/sync",
+        json=second_body,
+        headers=op(auth_headers, "sync-distinct-session-3"),
+    )
+    assert updated.status_code == 200
+    unchanged = api.get(f"/v1/memories/{first['memory']['id']}", headers=auth_headers).json()
+    assert unchanged["current_version"] == 1
+    assert unchanged["content_text"] == "项目使用 PostgreSQL 16。"
+
+
+def test_same_session_identifier_on_two_devices_has_independent_memory(api, auth_headers):
+    first = api.post(
+        "/v1/sessions/hermes/same-session/sync",
+        json=_sync_body(device_id="mac-a", memory={**_sync_body()["memory"], "source_session_id": "same-session"}),
+        headers=op(auth_headers, "sync-device-isolation-1"),
+    ).json()
+    second = api.post(
+        "/v1/sessions/hermes/same-session/sync",
+        json=_sync_body(device_id="mac-b", memory={**_sync_body()["memory"], "source_session_id": "same-session"}),
+        headers=op(auth_headers, "sync-device-isolation-2"),
+    ).json()
+    assert first["memory"]["id"] != second["memory"]["id"]
+
+
+def test_stale_session_sync_cannot_overwrite_newer_directory_state(api, auth_headers):
+    _upsert(api, auth_headers, "Mac-Hermes", "sess-1", "标题", "2026-08-21T10:00:00Z", "h2")
+    stale = api.post(
+        "/v1/sessions/Mac-Hermes/sess-1/sync",
+        json=_sync_body(content_hash="h1"),
+        headers=op(auth_headers, "sync-stale-content-1"),
+    )
+    assert stale.status_code == 409
+    session = api.get(
+        "/v1/sessions", headers=auth_headers, params={"project_key": "alpha"}
+    ).json()["items"][0]
+    assert session["content_hash"] == "h2"
+    assert session["sync_status"] == "never_synced"
+
+
+def test_deleting_linked_memory_makes_session_selectable_again(api, auth_headers):
+    synced = api.post(
+        "/v1/sessions/Mac-Hermes/sess-1/sync",
+        json=_sync_body(),
+        headers=op(auth_headers, "sync-delete-link-1"),
+    ).json()
+    deleted = api.request(
+        "DELETE",
+        f"/v1/memories/{synced['memory']['id']}",
+        json={"expected_version": 1, "source_agent": "hermes"},
+        headers=op(auth_headers, "sync-delete-link-2"),
+    )
+    assert deleted.status_code == 200
+    pending = api.get(
+        "/v1/sessions",
+        headers=auth_headers,
+        params={"project_key": "alpha", "synced": "false"},
+    ).json()["items"]
+    assert pending[0]["session_id"] == "sess-1"
+    assert pending[0]["synced_memory_id"] is None
+    assert pending[0]["sync_status"] == "never_synced"
 
 
 def test_sync_state_machine(api, auth_headers):
