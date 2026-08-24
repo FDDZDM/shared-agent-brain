@@ -1,0 +1,14 @@
+{
+  "name": "Shared Brain (corrected recipe)",
+  "kind": "fastapi",
+  "bootstrap": [
+    ".venv/bin/python -m pip install -e '.[dev]'"
+  ],
+  "build": [],
+  "test": [
+    "env -u PYTHONPATH .venv/bin/python -m pytest -q"
+  ],
+  "start": "rm -f /tmp/shared-brain-verify.db && env -u PYTHONPATH BRAIN_TOKEN=verify-token-long-enough-123456 BRAIN_DB_PATH=/tmp/shared-brain-verify.db .venv/bin/python -m uvicorn shared_brain.api:app_from_env --factory --host 127.0.0.1 --port 8787",
+  "port": 8787,
+  "readinessPath": "/health"
+}

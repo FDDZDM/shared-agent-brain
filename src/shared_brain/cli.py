@@ -43,10 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--project-key")
     config.add_argument("--token", help="prefer BRAIN_TOKEN or the secure prompt")
 
-    sub.add_parser("doctor", help="check server, auth, and retry queue")
+    sub.add_parser("doctor", help="check server, auth, database, project, FTS, and retry queue").add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
 
     queue = sub.add_parser("queue", help="inspect or flush offline writes")
-    queue.add_argument("action", choices=("list", "flush"))
+    queue.add_argument("action", choices=("list", "flush", "remove", "retry"))
+    queue.add_argument("op_key", nargs="?")
+    queue.add_argument("--verbose", action="store_true", help="show full payloads in list")
 
     memory = sub.add_parser("memory", help="manual memory operations")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
@@ -70,6 +74,65 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _doctor_report(client: SharedBrainClient) -> Dict[str, Any]:
+    """分项健康检查：network / server / auth / project / fts / queue。"""
+    checks: Dict[str, Any] = {}
+
+    try:
+        health = client.health()
+        checks["network"] = {"ok": True, "detail": "reachable"}
+        checks["server"] = {"ok": True, "detail": f"v{health.get('version', '?')}"}
+    except Exception as exc:
+        checks["network"] = {"ok": False, "detail": str(exc)}
+        checks["server"] = {"ok": False, "detail": "unreachable"}
+
+    try:
+        whoami = client.whoami()
+        checks["auth"] = {"ok": True, "detail": "token valid"}
+        if checks.get("server", {}).get("ok"):
+            checks["server"]["detail"] = (
+                f"v{whoami.get('server_version', '?')} · schema v{whoami.get('schema_version', '?')}"
+            )
+    except BrainClientError as exc:
+        status = f"{exc.status} " if exc.status else ""
+        checks["auth"] = {"ok": False, "detail": f"{status}{exc}"}
+    except Exception as exc:
+        checks["auth"] = {"ok": False, "detail": str(exc)}
+
+    project = getattr(client, "project_key", None)
+    checks["project"] = {
+        "ok": bool(project),
+        "detail": project or "missing project_key in config",
+    }
+
+    try:
+        client.search("doctor-probe-never-matches-12345")
+        checks["fts"] = {"ok": True, "detail": "search endpoint ok"}
+    except Exception as exc:
+        checks["fts"] = {"ok": False, "detail": str(exc)}
+
+    pending = client.queue.count()
+    failed = client.queue.count("failed")
+    checks["queue"] = {
+        "ok": failed == 0,
+        "detail": f"{pending} pending · {failed} failed",
+        "pending": pending,
+        "failed": failed,
+    }
+
+    ok = all(item.get("ok", True) for item in checks.values())
+    return {"ok": ok, "checks": checks}
+
+
+def _render_doctor(report: Dict[str, Any]) -> str:
+    lines = ["Shared Brain doctor"]
+    for name, check in report["checks"].items():
+        mark = "✓" if check["ok"] else "✗"
+        lines.append(f"  {name:<8} {mark} {check.get('detail', '')}")
+    lines.append("doctor: " + ("OK" if report["ok"] else "FAILED"))
+    return "\n".join(lines)
+
+
 def main(argv: Optional[list] = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "config":
@@ -91,16 +154,30 @@ def main(argv: Optional[list] = None) -> None:
     client = _client(args.config_path)
     try:
         if args.command == "doctor":
-            _json(
-                {
-                    "server": client.health(),
-                    "agent_id": client.agent_id,
-                    "project_key": client.project_key,
-                    "pending_ops": client.queue.count(),
-                }
-            )
+            report = _doctor_report(client)
+            if args.json:
+                _json(report)
+            else:
+                print(_render_doctor(report))
+            if not report["ok"]:
+                raise SystemExit(1)
         elif args.command == "queue":
-            _json(client.queue.list() if args.action == "list" else client.flush_queue())
+            if args.action == "list":
+                _json(client.queue.list(limit=500, include_payload=args.verbose))
+            elif args.action == "flush":
+                _json(client.flush_queue())
+            elif args.action == "remove":
+                if not args.op_key:
+                    raise SystemExit("usage: amm queue remove <op_key>")
+                if not client.queue.remove(args.op_key):
+                    raise SystemExit(f"no queued operation with op_key {args.op_key}")
+                print(f"removed {args.op_key}")
+            elif args.action == "retry":
+                if not args.op_key:
+                    raise SystemExit("usage: amm queue retry <op_key>")
+                if not client.queue.retry(args.op_key):
+                    raise SystemExit(f"no queued operation with op_key {args.op_key}")
+                print(f"retry scheduled for {args.op_key}")
         elif args.command == "memory" and args.memory_command == "search":
             _json(client.search(args.query, limit=args.limit))
         elif args.command == "memory" and args.memory_command == "remember":

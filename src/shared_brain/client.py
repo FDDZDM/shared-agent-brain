@@ -14,7 +14,9 @@ from .security import render_untrusted_memories
 
 
 class BrainClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 class SharedBrainClient:
@@ -27,11 +29,13 @@ class SharedBrainClient:
         queue_path: Optional[str] = None,
         timeout: float = 5.0,
         transport: Optional[httpx.BaseTransport] = None,
+        device_id: str = "",
     ):
         self.server_url = server_url.rstrip("/")
         self.token = token
         self.agent_id = agent_id
         self.project_key = project_key
+        self.device_id = device_id
         self.timeout = timeout
         path = queue_path or str(Path.home() / ".amm" / "queue.db")
         self.queue = OfflineQueue(path)
@@ -48,6 +52,15 @@ class SharedBrainClient:
     def health(self) -> Dict[str, Any]:
         response = self._client.get("/health")
         response.raise_for_status()
+        return response.json()
+
+    def whoami(self) -> Dict[str, Any]:
+        """鉴权身份/能力探测：验证 token 有效并返回服务/schema 版本。"""
+        response = self._client.get("/v1/whoami")
+        if response.status_code >= 400:
+            raise BrainClientError(
+                f"{response.status_code}: {response.text}", status=response.status_code
+            )
         return response.json()
 
     def _write(
@@ -72,7 +85,9 @@ class SharedBrainClient:
             self.queue.enqueue(method, path, payload, key, str(exc))
             return {"queued": True, "op_key": key, "error": str(exc)}
         if response.status_code >= 400:
-            raise BrainClientError(f"{response.status_code}: {response.text}")
+            raise BrainClientError(
+                f"{response.status_code}: {response.text}", status=response.status_code
+            )
         return response.json()
 
     def remember(
@@ -144,6 +159,8 @@ class SharedBrainClient:
         min_trust_level: int = 0,
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
+        # 服务端 q 上限 1000 字符：客户端先行截断，避免自然问句超长触发 422。
+        query = (query or "").strip()[:1000]
         params: Dict[str, Any] = {
             "q": query,
             "project_key": project_key if project_key is not None else self.project_key,
@@ -161,9 +178,10 @@ class SharedBrainClient:
             raise BrainClientError(f"{response.status_code}: {response.text}")
         return response.json()["items"]
 
-    def prefetch(self, query: str, limit: int = 5, min_trust_level: int = 0) -> str:
+    def prefetch(self, query: str, limit: int = 5, min_trust_level: int = 0, max_chars: int = 6000) -> str:
         return render_untrusted_memories(
-            self.search(query, limit=limit, min_trust_level=min_trust_level)
+            self.search(query, limit=limit, min_trust_level=min_trust_level),
+            max_chars=max_chars,
         )
 
     def list_recent_memories(
@@ -189,37 +207,84 @@ class SharedBrainClient:
         session_id: str,
         title: Optional[str],
         updated_at: str,
+        project_key: Optional[str] = None,
+        device_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         response = self._client.post(
             "/v1/sessions",
             json={
+                "project_key": project_key if project_key is not None else self.project_key or "",
                 "agent_id": agent_id,
+                "device_id": self.device_id if device_id is None else device_id,
                 "session_id": session_id,
                 "title": title,
                 "updated_at": updated_at,
+                "content_hash": content_hash,
             },
         )
         if response.status_code >= 400:
             raise BrainClientError(f"{response.status_code}: {response.text}")
         return response.json()
 
-    def mark_session_synced(self, agent_id: str, session_id: str) -> Dict[str, Any]:
+    def mark_session_synced(
+        self,
+        agent_id: str,
+        session_id: str,
+        project_key: Optional[str] = None,
+        device_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         agent = urlparse.quote(agent_id, safe="")
         session = urlparse.quote(session_id, safe="")
-        response = self._client.post(f"/v1/sessions/{agent}/{session}/synced")
+        params = {
+            "project_key": project_key if project_key is not None else self.project_key or "",
+            "device_id": self.device_id if device_id is None else device_id,
+        }
+        response = self._client.post(f"/v1/sessions/{agent}/{session}/synced", params=params)
         if response.status_code >= 400:
             raise BrainClientError(f"{response.status_code}: {response.text}")
         return response.json()
 
+    def sync_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        memory_payload: Dict[str, Any],
+        content_hash: Optional[str] = None,
+        device_id: Optional[str] = None,
+        op_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """复合原子同步：一次请求内写入记忆并标记会话已同步（离线可排队）。"""
+        agent = urlparse.quote(agent_id, safe="")
+        session = urlparse.quote(session_id, safe="")
+        memory = dict(memory_payload)
+        if memory.get("scope", "project") == "project":
+            memory["project_key"] = memory.get("project_key") or self.project_key or ""
+        memory["source_session_id"] = session_id
+        body = {
+            "project_key": memory.get("project_key") or self.project_key or "",
+            "device_id": self.device_id if device_id is None else device_id,
+            "content_hash": content_hash,
+            "memory": memory,
+        }
+        return self._write("POST", f"/v1/sessions/{agent}/{session}/sync", body, op_key)
+
     def list_sessions(
         self,
+        project_key: Optional[str] = None,
         agent: Optional[str] = None,
+        device_id: Optional[str] = None,
         synced: Optional[bool] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"limit": limit}
+        params: Dict[str, Any] = {
+            "project_key": project_key if project_key is not None else self.project_key or "",
+            "limit": limit,
+        }
         if agent:
             params["agent"] = agent
+        if device_id is not None:
+            params["device_id"] = device_id
         if synced is not None:
             params["synced"] = str(synced).lower()
         response = self._client.get("/v1/sessions", params=params)
@@ -227,16 +292,28 @@ class SharedBrainClient:
             raise BrainClientError(f"{response.status_code}: {response.text}")
         return response.json()["items"]
 
-    def list_agents(self) -> List[Dict[str, Any]]:
-        response = self._client.get("/v1/sessions/agents")
+    def list_agents(self, project_key: Optional[str] = None, device_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        params = {"project_key": project_key if project_key is not None else self.project_key or ""}
+        if device_id is not None:
+            params["device_id"] = device_id
+        response = self._client.get("/v1/sessions/agents", params=params)
         if response.status_code >= 400:
             raise BrainClientError(f"{response.status_code}: {response.text}")
         return response.json()["items"]
 
     def flush_queue(self, limit: int = 100) -> Dict[str, int]:
+        """Replay due offline writes.
+
+        Error handling:
+        - transport errors  -> retryable, keep FIFO order, stop this pass
+        - 5xx               -> retryable, stop this pass (server trouble)
+        - 409 conflicts     -> retryable but must NOT block the rest of the
+                               queue; task keeps retrying until max_attempts
+        - other 4xx         -> non-retryable (permanent) failure, skip
+        """
         sent = 0
         failed = 0
-        for item in self.queue.list(limit):
+        for item in self.queue.list(limit, due_only=True):
             try:
                 self._write(
                     item["method"],
@@ -245,12 +322,18 @@ class SharedBrainClient:
                     item["op_key"],
                     queue_on_failure=False,
                 )
-            except (httpx.TransportError, BrainClientError) as exc:
-                self.queue.mark_failed(item["op_key"], str(exc))
+            except httpx.TransportError as exc:
+                self.queue.mark_failed(item["op_key"], str(exc), retryable=True)
                 failed += 1
                 break
+            except BrainClientError as exc:
+                retryable = exc.status is None or exc.status >= 500 or exc.status == 409
+                self.queue.mark_failed(item["op_key"], str(exc), retryable=retryable)
+                failed += 1
+                if retryable and exc.status != 409:
+                    break
+                # 409 / 非重试错误：不阻塞队列中的后续任务
             else:
                 self.queue.remove(item["op_key"])
                 sent += 1
         return {"sent": sent, "failed": failed, "remaining": self.queue.count()}
-

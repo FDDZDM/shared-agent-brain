@@ -3,6 +3,7 @@ import { dirname } from 'node:path'
 import type { PendingOperation, QueueAdapter } from './client.js'
 
 export class JsonOperationQueue implements QueueAdapter {
+  private static readonly maxAttempts = 10
   constructor(readonly path: string) {
     mkdirSync(dirname(path), { recursive: true })
   }
@@ -31,17 +32,32 @@ export class JsonOperationQueue implements QueueAdapter {
     }
   }
 
-  list(): PendingOperation[] {
-    return this.read()
+  list(dueOnly = false): PendingOperation[] {
+    const now = new Date().toISOString()
+    return this.read().filter(item => !dueOnly || (
+      item.status !== 'failed' && (!item.nextRetryAt || item.nextRetryAt <= now)
+    ))
   }
 
   remove(opKey: string): void {
     this.write(this.read().filter(item => item.opKey !== opKey))
   }
 
-  fail(opKey: string, error: string): void {
-    this.write(this.read().map(item => item.opKey === opKey
-      ? { ...item, attempts: item.attempts + 1, lastError: error.slice(0, 2000) }
-      : item))
+  fail(opKey: string, error: string, retryable = true): void {
+    this.write(this.read().map(item => {
+      if (item.opKey !== opKey) return item
+      const attempts = item.attempts + 1
+      if (!retryable || attempts >= JsonOperationQueue.maxAttempts) {
+        return { ...item, attempts, lastError: error.slice(0, 2000), status: 'failed', nextRetryAt: undefined }
+      }
+      const delayMs = Math.min(2 ** attempts, 3600) * 1000
+      return {
+        ...item,
+        attempts,
+        lastError: error.slice(0, 2000),
+        status: 'pending',
+        nextRetryAt: new Date(Date.now() + delayMs).toISOString(),
+      }
+    }))
   }
 }

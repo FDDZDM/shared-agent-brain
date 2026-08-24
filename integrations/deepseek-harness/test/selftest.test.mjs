@@ -21,7 +21,11 @@ function fakeServer({ healthStatus = 200 } = {}) {
       const q = parsed.searchParams.get('q') ?? ''
       const pk = parsed.searchParams.get('project_key')
       if (!init.headers?.authorization) return respond(401, { error: 'unauthorized' })
-      const items = memories.filter(m => m._project_key === pk && m.content_text.includes(q))
+      // Mirror the real trigram OR behavior for T11: records from the same run
+      // share the selftest marker, so deleting one does not imply zero results.
+      const marker = q.startsWith('自测检索验证 selftest-') ? q.split(' ').at(-1) : null
+      const items = memories.filter(m => m._project_key === pk
+        && (m.content_text.includes(q) || (marker && m.content_text.includes(marker))))
       return respond(200, { items })
     }
     if (path === '/v1/memories' && init.method === 'POST') {
@@ -86,6 +90,7 @@ test('full selftest passes all 12 items and leaves no test data', async () => {
   assert.equal(report.passed, true)
   assert.deepEqual(report.results.map(r => r.id), ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8', 'T9', 'T10', 'T11', 'T12'])
   assert.ok(report.results.every(r => r.status === 'pass'))
+  assert.match(report.results.find(r => r.id === 'T11').detail, /另有 1 条同批次命中/)
   assert.ok(server.memories.every(m => m._project_key !== SELFTEST_PROJECT))
 })
 

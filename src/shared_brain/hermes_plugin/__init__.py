@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -46,6 +47,7 @@ class SharedBrainMemoryProvider(MemoryProvider):
             "agent_id": os.environ.get("BRAIN_AGENT_ID") or configured.get("agent_id") or "hermes",
             "project_key": os.environ.get("BRAIN_PROJECT_KEY") or configured.get("project_key"),
             "queue_path": configured.get("queue_path") or str(home / "shared-brain-queue.db"),
+            "device_id": os.environ.get("BRAIN_DEVICE_ID") or configured.get("device_id") or "",
             "recall_limit": int(configured.get("recall_limit", 5)),
             "min_trust_level": int(configured.get("min_trust_level", 0)),
         }
@@ -65,6 +67,7 @@ class SharedBrainMemoryProvider(MemoryProvider):
             self._config["agent_id"],
             self._config.get("project_key"),
             self._config.get("queue_path"),
+            device_id=str(self._config.get("device_id") or ""),
         )
         # Replays durable writes left by an earlier offline process. Failure is non-fatal.
         try:
@@ -248,11 +251,17 @@ class SharedBrainMemoryProvider(MemoryProvider):
                 if message.get("role") == "user" and isinstance(content, str) and content.strip():
                     title = content.strip()[:80]
                     break
+            content_fingerprint = hashlib.sha256(
+                json.dumps(messages, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:32]
             self._client.upsert_session(
                 str(self._config.get("agent_id") or "hermes"),
                 self._session_id,
                 title or None,
                 datetime.now(timezone.utc).isoformat(),
+                project_key=self._config.get("project_key"),
+                device_id=str(self._config.get("device_id") or ""),
+                content_hash=content_fingerprint,
             )
         except Exception:
             return
@@ -276,21 +285,31 @@ def _read_hermes_session_text(session_id: str, limit_chars: int = 8000) -> str:
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            rows = conn.execute(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id LIMIT 300",
+            first_rows = conn.execute(
+                "SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id LIMIT 100",
                 (session_id,),
             ).fetchall()
+            last_rows = conn.execute(
+                "SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 200",
+                (session_id,),
+            ).fetchall()
+            rows = sorted({row[0]: row for row in [*first_rows, *last_rows]}.values())
         finally:
             conn.close()
     except Exception:
         return ""
     parts = []
-    for role, content in rows:
+    for _, role, content in rows:
         if not content:
             continue
         text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
         parts.append(f"{role}: {text[:400]}")
-    return "\n".join(parts)[:limit_chars]
+    transcript = "\n".join(parts)
+    if len(transcript) <= limit_chars:
+        return transcript
+    prefix_size = limit_chars * 3 // 8
+    suffix_size = limit_chars - prefix_size
+    return f"{transcript[:prefix_size]}\n[…中间内容已截断…]\n{transcript[-suffix_size:]}"
 
 
 def _make_slash_client() -> SharedBrainClient:
@@ -307,7 +326,10 @@ def _make_slash_client() -> SharedBrainClient:
     project_key = os.environ.get("BRAIN_PROJECT_KEY") or configured.get("project_key")
     if not server_url or not token:
         raise RuntimeError("Shared Brain requires BRAIN_URL and BRAIN_TOKEN (config or env)")
-    return SharedBrainClient(server_url, token, agent_id, project_key, str(home / "shared-brain-queue.db"))
+    device_id = os.environ.get("BRAIN_DEVICE_ID") or configured.get("device_id") or ""
+    return SharedBrainClient(
+        server_url, token, agent_id, project_key, str(home / "shared-brain-queue.db"), device_id=device_id
+    )
 
 
 def _slash_commands() -> List[tuple]:
@@ -315,31 +337,60 @@ def _slash_commands() -> List[tuple]:
 
     One command with subcommands keeps the user-facing surface distinct from
     the brain_* tool names (no collision between tools and commands), while
-    staying identical across Hermes and DSH. /brain (bare) or /brain help
-    shows the manual.
+    staying identical across Hermes and DSH. Only /brain help shows the manual;
+    bare /brain is the browse entry point.
     """
     help_text = "\n".join([
         "Shared Brain 命令说明书（子命令与 brain_* 工具一一对应）:",
-        "/brain（无参）                                # 列表选择模式：先选 agent 再选会话/记忆",
-        "/brain search <query>                        # 搜索共享记忆（无参=浏览最近记忆）",
-        "/brain remember [<title> | <content>]        # 无参=列未上传会话选编号上传；带参=直接保存",
-        "/brain update [<id> <expected_version> | <new content>]   # 无参=列记忆选编号更新",
-        "/brain forget [<id> <expected_version>]      # 无参=列记忆选编号删除",
-        "/brain test [quick]                          # 运行全链路自检并显示报告",
-        "/brain help                                  # 显示本说明书",
+        "## Shared Brain 命令说明书",
+        "",
+        "| 命令 | 说明 |",
+        "|---|---|",
+        "| `/brain`（无参） | 进入列表选择：先选 agent 再选会话/记忆 |",
+        "| `/brain search <query>` | 搜索共享记忆（无参=浏览最近记忆） |",
+        "| `/brain remember [<title> \\| <content>]` | 无参=选待同步会话，首次创建、后续更新原记忆；带参=直接保存 |",
+        "| `/brain update [<id> <expected_version> \\| <new content>]` | 无参=选记忆后输入新内容 |",
+        "| `/brain forget [<id> <expected_version>]` | 无参=选记忆后确认删除 |",
+        "| `/brain test [quick]` | 运行全链路自检并显示报告 |",
+        "| `/brain setup` | 校验当前配置并重放离线队列；Hermes 重启后加载插件新代码 |",
+        "| `/brain help` | 显示本说明书 |",
     ])
 
     def brain_command(raw_args: str) -> str:
         parts = raw_args.strip().split(None, 1)
         sub = parts[0].lower() if parts else ""
         args = parts[1].strip() if len(parts) > 1 else ""
-        if not sub or sub == "help":
+        if sub == "help":
             return help_text
         try:
             client = _make_slash_client()
         except Exception as exc:
             return f"Shared Brain is not configured: {exc}"
 
+        if not sub:
+            try:
+                agents = client.list_agents(device_id=client.device_id)
+                if not agents:
+                    return "暂无可浏览的共享内容。"
+                lines = ["Shared Brain 浏览入口：请选择 agent，然后告诉我想查看其‘记忆’还是‘会话’。"]
+                for agent in agents:
+                    lines.append(
+                        f"- {agent['agent_id']}：{agent['total_count']} 个会话，{agent['unsynced_count']} 个待同步"
+                    )
+                return "\n".join(lines)
+            except Exception as exc:
+                return f"Shared Brain browse failed: {exc}"
+        if sub == "setup":
+            if args:
+                return "Usage: /brain setup"
+            try:
+                client.flush_queue()
+                return (
+                    "Shared Brain 配置与离线队列已校验。"
+                    "Hermes 当前不提供插件热重载；若刚更新过插件代码，请重启 Hermes。"
+                )
+            except Exception as exc:
+                return f"Shared Brain setup failed: {exc}"
         if sub == "search":
             if not args:
                 # 无参：列最近记忆（编号），/brain search <编号> 看详情
@@ -372,16 +423,16 @@ def _slash_commands() -> List[tuple]:
                 return f"Shared Brain search failed: {exc}"
         if sub == "remember":
             if not args:
-                # 无参：列未上传会话（编号选择，先显示 agent 归属）
+                # 无参：列待同步会话（首次未上传或同步后内容已变化）
                 try:
-                    sessions = client.list_sessions(synced=False, limit=100)
+                    sessions = client.list_sessions(synced=False, device_id=client.device_id, limit=100)
                     if not sessions:
                         return (
-                            "没有未上传的会话（会话结束时会自动上报）。\n"
+                            "没有待同步的会话（新会话或同步后继续对话的会话，会在结束时自动进入列表）。\n"
                             "用法: /brain remember <title> | <content> 直接保存"
                         )
                     lines = [
-                        "未上传的会话（输入 /brain remember <编号> <标题> 上传；"
+                        "待同步的会话（输入 /brain remember <编号> <标题> 同步；"
                         "Hermes 端上传原始会话文本、不做提炼）:"
                     ]
                     for i, s in enumerate(sessions, 1):
@@ -397,28 +448,34 @@ def _slash_commands() -> List[tuple]:
                 if parts and parts[0].isdigit():
                     # 编号 + 标题：从服务器目录取会话 → 读本机会话文本 → 上传
                     try:
-                        sessions = client.list_sessions(synced=False, limit=100)
+                        sessions = client.list_sessions(synced=False, device_id=client.device_id, limit=100)
                         idx = int(parts[0]) - 1
                         if idx < 0 or idx >= len(sessions):
-                            return f"编号越界（共 {len(sessions)} 个未上传会话）"
+                            return f"编号越界（共 {len(sessions)} 个待同步会话）"
                         session = sessions[idx]
                         title = parts[1].strip() if len(parts) > 1 else (session["title"] or "Hermes 会话")
                         content = _read_hermes_session_text(session["session_id"])
                         if not content:
                             return "无法读取会话内容（state.db 未找到该会话）"
-                        result = client.remember(
-                            title,
-                            content,
-                            scope="project",
-                            kind="fact",
-                            source_session_id=session["session_id"],
+                        result = client.sync_session(
+                            session["agent_id"],
+                            session["session_id"],
+                            {
+                                "scope": "project",
+                                "kind": "fact",
+                                "title": title,
+                                "content_text": content,
+                                "source_agent": client.agent_id,
+                                "source_session_id": session["session_id"],
+                            },
+                            content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest()[:32],
                         )
                         if "queued" in result:
                             return "Saved to offline queue (will sync when back online)."
-                        client.mark_session_synced(session["agent_id"], session["session_id"])
+                        action = "已更新原记忆" if result["memory"]["current_version"] > 1 else "已创建记忆"
                         return (
-                            f"✅ 已上传 v{result['current_version']}: {result['title']}"
-                            f"（{session['agent_id']} 的会话已标记）"
+                            f"✅ {action} v{result['memory']['current_version']}: {result['memory']['title']}"
+                            f"（{session['agent_id']} 的会话已标记，同步状态：{result['session']['sync_status']}）"
                         )
                     except Exception as exc:
                         return f"Shared Brain save failed: {exc}"
@@ -552,5 +609,12 @@ def register(ctx: Any) -> None:
         ctx.register_memory_provider(SharedBrainMemoryProvider())
     if hasattr(ctx, "register_command"):
         for name, args_hint, description, handler in _slash_commands():
-            ctx.register_command(name, handler, description, args_hint)
-
+            async def wrapped(raw_args: str, _handler: Callable = handler) -> str:
+                result = _handler(raw_args)
+                if hasattr(result, "__await__"):
+                    result = await result
+                # Hermes has no pre-step veto for plugin-only injected input.
+                # Always use its command-result channel; inject_message(role=user)
+                # would wake the model and turn a receipt into a fake request.
+                return str(result or "")
+            ctx.register_command(name, wrapped, description, args_hint)

@@ -11,7 +11,15 @@ from fastapi.responses import JSONResponse
 
 from .db import BrainStore
 from .errors import BrainError, ConflictError, NotFoundError, ValidationError
-from .models import MemoryCreate, MemoryDelete, MemoryKind, MemoryScope, MemoryUpdate, SessionCreate
+from .models import (
+    MemoryCreate,
+    MemoryDelete,
+    MemoryKind,
+    MemoryScope,
+    MemoryUpdate,
+    SessionCreate,
+    SessionSync,
+)
 from .security import request_hash, verify_token
 
 
@@ -94,7 +102,21 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
             min_trust_level=min_trust_level,
             limit=limit,
         )
-        return {"items": items, "count": len(items)}
+        return {
+            "items": items,
+            "count": len(items),
+            "strategy": items[0]["match_strategy"] if items else None,
+        }
+
+    @app.get("/v1/whoami", dependencies=[Depends(authenticate)])
+    def whoami() -> dict:
+        """鉴权身份/能力探测（doctor 用）：证明 token 有效，绝不回显 token。"""
+        return {
+            "server_version": app.version,
+            "schema_version": store.schema_version(),
+            "capabilities": ["memories", "sessions", "sync", "search"],
+            "projects": None,  # 单共享 token 模式：不限制项目
+        }
 
     @app.get("/v1/memories", dependencies=[Depends(authenticate)])
     def list_memories(
@@ -102,14 +124,17 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
         project_key: Optional[str] = Query(default=None, max_length=255),
         source_agent: Optional[str] = Query(default=None, max_length=128),
         limit: int = Query(default=50, ge=1, le=100),
+        cursor: Optional[str] = Query(default=None, max_length=200),
     ) -> dict:
-        items = store.list_recent_memories(
+        result = store.list_recent_memories(
             scope=scope.value if scope else None,
             project_key=project_key,
             source_agent=source_agent,
             limit=limit,
+            cursor=cursor,
         )
-        return {"items": items, "count": len(items)}
+        result["count"] = len(result["items"])
+        return result
 
     @app.get("/v1/memories/changes", dependencies=[Depends(authenticate)])
     def memory_changes(
@@ -117,9 +142,9 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
         project_key: Optional[str] = Query(default=None, max_length=255),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict:
-        items = store.changes_since(cursor, project_key, limit)
-        next_cursor = items[-1]["change_seq"] if items else cursor
-        return {"items": items, "count": len(items), "next_cursor": next_cursor}
+        result = store.changes_since(cursor, project_key, limit)
+        result["count"] = len(result["items"])
+        return result
 
     @app.get("/v1/memories/{memory_id}", dependencies=[Depends(authenticate)])
     def get_memory(memory_id: str, include_deleted: bool = False) -> dict:
@@ -163,25 +188,80 @@ def create_app(db_path: Optional[str] = None, token: Optional[str] = None) -> Fa
     @app.post("/v1/sessions", dependencies=[Depends(authenticate)])
     def upsert_session(body: SessionCreate) -> dict:
         return store.upsert_session(
-            body.agent_id, body.session_id, body.title, body.updated_at
+            body.agent_id,
+            body.session_id,
+            body.title,
+            body.updated_at,
+            project_key=body.project_key,
+            device_id=body.device_id,
+            content_hash=body.content_hash,
         )
 
+    @app.post("/v1/sessions/{agent_id}/{session_id}/sync", dependencies=[Depends(authenticate)])
+    def sync_session(
+        agent_id: str,
+        session_id: str,
+        body: SessionSync,
+        op_key: str = Depends(idempotency_key),
+    ) -> JSONResponse:
+        """复合原子同步：同一事务写入记忆并标记会话，杜绝中间态与重复摘要。"""
+        path = f"/v1/sessions/{agent_id}/{session_id}/sync"
+        status, result = store.complete_session_sync(
+            agent_id,
+            session_id,
+            {
+                "project_key": body.project_key,
+                "device_id": body.device_id,
+                "content_hash": body.content_hash,
+            },
+            _dump(body.memory),
+            op_key,
+            request_hash("POST", path, _dump(body)),
+        )
+        return JSONResponse(status_code=status, content=result)
+
     @app.post("/v1/sessions/{agent_id}/{session_id}/synced", dependencies=[Depends(authenticate)])
-    def mark_session_synced(agent_id: str, session_id: str) -> dict:
-        return store.mark_session_synced(agent_id, session_id)
+    def mark_session_synced(
+        agent_id: str,
+        session_id: str,
+        project_key: str = Query(min_length=1, max_length=255),
+        device_id: str = Query(default="", max_length=128),
+        memory_id: Optional[str] = Query(default=None, max_length=255),
+    ) -> dict:
+        return store.mark_session_synced(
+            agent_id,
+            session_id,
+            project_key=project_key,
+            device_id=device_id,
+            memory_id=memory_id,
+        )
 
     @app.get("/v1/sessions", dependencies=[Depends(authenticate)])
     def list_sessions(
+        project_key: str = Query(min_length=1, max_length=255),
         agent: Optional[str] = Query(default=None, max_length=128),
+        device_id: Optional[str] = Query(default=None, max_length=128),
         synced: Optional[bool] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None, max_length=200),
     ) -> dict:
-        items = store.list_sessions(agent_id=agent, synced=synced, limit=limit)
-        return {"items": items, "count": len(items)}
+        result = store.list_sessions(
+            project_key=project_key,
+            agent_id=agent,
+            device_id=device_id,
+            synced=synced,
+            limit=limit,
+            cursor=cursor,
+        )
+        result["count"] = len(result["items"])
+        return result
 
     @app.get("/v1/sessions/agents", dependencies=[Depends(authenticate)])
-    def list_agents() -> dict:
-        items = store.list_agents()
+    def list_agents(
+        project_key: str = Query(min_length=1, max_length=255),
+        device_id: Optional[str] = Query(default=None, max_length=128),
+    ) -> dict:
+        items = store.list_agents(project_key=project_key, device_id=device_id)
         return {"items": items, "count": len(items)}
 
     return app

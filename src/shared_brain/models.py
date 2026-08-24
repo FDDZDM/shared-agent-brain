@@ -61,8 +61,27 @@ class MemoryDelete(MemoryModel):
 
 
 class SessionCreate(MemoryModel):
+    project_key: str = Field(min_length=1, max_length=255)
     agent_id: str = Field(min_length=1, max_length=128)
+    device_id: str = Field(default="", max_length=128)
     session_id: str = Field(min_length=1, max_length=255)
     title: Optional[str] = Field(default=None, max_length=300)
     updated_at: str = Field(min_length=1, max_length=64)
+    content_hash: Optional[str] = Field(default=None, max_length=64)
 
+
+class SessionSync(MemoryModel):
+    """复合原子同步：同一请求内写入记忆并标记会话已同步。"""
+
+    project_key: str = Field(min_length=1, max_length=255)
+    device_id: str = Field(default="", max_length=128)
+    content_hash: Optional[str] = Field(default=None, max_length=64)
+    memory: MemoryCreate
+
+    @model_validator(mode="after")
+    def require_project_memory_in_same_project(self) -> "SessionSync":
+        if self.memory.scope != MemoryScope.PROJECT:
+            raise ValueError("session sync memory must use scope=project")
+        if self.memory.project_key != self.project_key:
+            raise ValueError("memory.project_key must match session project_key")
+        return self

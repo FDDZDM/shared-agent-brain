@@ -249,9 +249,13 @@ export async function runSelftest(
       if (!target) return noData()
       const record = await client.forget(target.id, target.version)
       if ('queued' in record) return bad('入队离线（未同步）')
-      // 只匹配 T4 创建的那条（幂等测试记录不含 `自测检索验证` 前缀）。
+      // FTS 使用 trigram OR，T9 的幂等记录共享本轮 marker，也可能被召回。
+      // tombstone 的正确判据是目标 id 消失，而不是整个结果集必须为空。
       const items = await client.search(`自测检索验证 ${marker}`, 5, SELFTEST_PROJECT)
-      return items.length === 0 ? ok('已删除') : bad(`删除后仍命中 ${items.length} 条`)
+      const targetStillVisible = items.some(item => item.id === target.id)
+      return targetStillVisible
+        ? bad(`删除目标 ${target.id.slice(0, 8)}… 仍可见`)
+        : ok(`目标已隐藏（另有 ${items.length} 条同批次命中）`)
     })
   }
 

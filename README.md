@@ -126,23 +126,36 @@ hermes memory status   # Provider: shared-brain / available ✓
 **斜杠命令**（与 DSH 端同名同义，全端统一词汇）：Hermes 的 memory provider 路径本身不支持注册命令（`kind=exclusive` 路由限制），需在插件 `plugin.yaml` 显式声明 `kind: standalone` 并 `hermes plugins enable shared-brain`，让通用 PluginManager 加载（`register()` 内 hasattr 双守卫兼容两条加载路径）。启用后新会话可用：
 
 ```text
-/brain（无参）                                 # 列表选择模式：先选 agent 再选会话/记忆
+/brain（无参）                                 # 进入列表选择：先选 agent 再选会话/记忆
 /brain search <query>                        # 搜索共享记忆（无参=浏览最近记忆）
-/brain remember [<title> | <content>]        # 无参=选未上传会话自动提炼上传；带参=直接保存
+/brain remember [<title> | <content>]        # 无参=选待同步会话；首次创建，后续更新原记忆版本
 /brain update [<id> <expected_version> | <new content>]   # 无参=选记忆后输入新内容
 /brain forget [<id> <expected_version>]      # 无参=选记忆后确认删除
 /brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
+/brain setup                                 # 校验配置和队列；DSH 热重载插件
 /brain help                                  # 命令说明书
 ```
 
 与 DSH 端完全同构（单一 `/brain` + 子命令，子命令与 `brain_*` 工具一一对应，命令面与工具面不撞名）。
 
 **交互设计（v2，列表选择优先）**：无参调用不再要求手输，而是**从服务器拉候选列表让用户选择**——
-`remember` 先列 agent（init 时配置的 agent name，如 `Mac-Hermes`）→ 列该 agent 的**未上传会话** →
-手动设标题 → DSH 端由模型自动提炼会话内容入库；`update`/`forget` 按 agent 分组列记忆后选择；
+`remember` 先列 agent（init 时配置的 agent name，如 `Mac-Hermes`）→ 列该 agent 的**待同步会话**
+（首次未同步，或同步后继续产生了新对话）→
+显示当前会话 Agent 生成的标题以及创建时间、最近修改时间 → 保存前允许用户沿用或自定义标题 →
+DSH 端由模型自动提炼会话内容入库；`update`/`forget` 按 agent 分组列记忆后选择；
 `search` 无参浏览最近记忆。会话目录（agent → 会话）由各客户端在会话结束时自动上报到服务器
-（Hermes 用 `on_session_end`，DSH 用 `session/event` turn/end）。平台差异：DSH 端有弹窗选择 +
+（Hermes 用 `on_session_end`；DSH 同时监听 `turn/end` 和标题生成后的 `session/title`，并在打开
+`remember` 列表时从本地会话日志修复旧的空标题；列表不再以 session id 充当标题）。平台差异：DSH 端有弹窗选择 +
 LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题>`），上传原始会话文本（未提炼）。
+
+**提炼方式**：DSH 插件复用当前 Agent 已选择的 provider/model 发起一次**隔离模型调用**，
+输入只包含用户选中的源会话，不携带当前聊天历史，也不触发 Shared Brain 自动召回。源会话中仅保留
+真人用户消息及同一真人轮次的最终助手答复；共享记忆引用、插件通知、工具结果、带工具调用的中间推理，
+以及没有真人输入的旧 handoff 轮次全部排除。当前会话会置顶并标注“当前会话”；提炼完成后
+插件直接执行复合会话同步。无需配置额外 agent 或 `summarizeModel`，服务器仍保持零 LLM。
+首次同步创建记忆 v1；原会话后续内容指纹变化时状态转为 `changed`，再次执行 `remember` 会沿
+`synced_memory_id` 原子追加 v2、v3……，不会创建重复记忆。长会话采用“开头 + 最新内容”窗口，
+避免超过长度预算后新增对话无法触发变更。
 
 ---
 
@@ -182,14 +195,19 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 
 ```text
 /brain search <query>                        # 搜索共享记忆
-/brain remember <title> | <content>          # 存一条事实（scope=project）
+/brain remember <title> | <content>          # 直接存一条事实；无参则同步新增/已变化会话
 /brain update <id> <expected_version> | <new content>   # 乐观锁更新
 /brain forget <id> <expected_version>        # tombstone 删除
 /brain test [quick]                          # 全链路自检（T1-T12），会话窗口显示报告
+/brain setup                                 # 校验配置和队列；DSH 热重载插件
 /brain help                                  # 命令说明书
 ```
 
-`/brain`（无参）与 `/brain help` 显示说明书；命令执行结果通过 `agent.steer` 以 **plugin notice** 形式**写入会话**（`plugin: shared-brain`）供回看，usage/未知子命令提示不写入避免噪音。注意：写入会话意味着结果进入会话历史，后续轮次的模型上下文可见（有少量 token 成本）。
+`/brain setup` 会先重放可执行的离线队列。DSH 端随后通过 Cordis fiber 热重载当前插件，
+无需退出整个桌面应用；Hermes 当前没有对应的插件热重载生命周期，因此会完成配置校验并明确提示重启。
+注意：首次安装包含 `setup` 的新版本时，旧进程尚未注册该命令，仍需重启一次；之后即可直接使用。
+
+只有 `/brain help` 显示说明书；`/brain`（无参）进入 agent → 会话/记忆的列表选择。DSH 的说明书、成功通知、错误回执和用法提示都会作为 plugin notice 写入会话；注入成功后命令返回空 success，避免终端重复输出，同时 `agent/pre-step` 会拒绝由该 notice 单独唤起的模型步骤，因此 Agent 不会再对 “forget failed” 或 “Saved v1” 作二次解释和追问。只有会话注入接口不可用时才降级到终端。Hermes 缺少对应的 pre-step 拦截能力，所以全部命令结果直接返回，禁止使用会唤醒模型的 `inject_message(role=user)`。平台有原生选项选择器时优先使用，不要求用户读取终端输出后手输编号。
 
 ---
 
@@ -222,8 +240,9 @@ DELETE /v1/memories/{id}                   # tombstone：body 带 expected_versi
 
 # 会话目录（remember 的 agent → 会话两级选择）
 POST   /v1/sessions                        # 客户端上报会话元数据（幂等 upsert，synced 状态保留）
-GET    /v1/sessions?agent=...&synced=false # 按 agent 列会话（可筛未上传）
-GET    /v1/sessions/agents                 # distinct agent + 未上传计数
+GET    /v1/sessions?agent=...&synced=false # 按 agent 列待同步会话（未同步或 changed）
+GET    /v1/sessions/agents                 # distinct agent + 待同步计数
+POST   /v1/sessions/{agent}/{session}/sync # 原子写入记忆并标记会话同步
 POST   /v1/sessions/{agent}/{session}/synced   # 标记会话已上传
 ```
 
@@ -242,12 +261,18 @@ cd integrations/deepseek-harness
 npm run check && npm test && npm run build
 ```
 
+Python 套件包含真实跨语言互通测试：临时启动一个 Shared Brain HTTP 服务，
+让 Python Hermes provider 与编译后的 TypeScript DSH client 同时连接，验证
+Hermes → DSH、DSH → Hermes 双向写读、复合会话同步和并发更新 409。运行该套件
+因此需要本机同时安装 Python 依赖、Node.js 与 DSH 插件依赖。
+
 端到端验收（部署/接线后）：
 1. 服务器 `/health` 200；无 token 401。
 2. 任一端会话执行 **`/brain test`**：12 项自检（连通/鉴权/配置/写入/FTS 中文检索/LIKE 短词/乐观锁 409/版本更新/幂等/项目隔离/tombstone/数据清理）全部通过，测试报告写入会话窗口；`/brain test quick` 为快速版（5 项 + 清理）。
 3. Hermes 新会话 `prefetch` 注入（带 `untrusted-reference-data` 安全边界声明）。
 4. DSH 会话 `brain_search`/`brain_remember` 可用，step 1 前自动注入引用资料。
 5. 两端写同一 `project_key` 的记忆互相可见。
+6. 两端并发更新同一版本时恰好一端成功，另一端收到 409，且最终版本两端一致。
 
 ---
 

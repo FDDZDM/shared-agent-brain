@@ -236,11 +236,17 @@ def run_selftest(client: SharedBrainClient, quick: bool = False) -> Dict[str, An
                 result = client.forget(target["id"], int(target["version"]))
                 if "queued" in result:
                     return False, "入队离线（未同步）"
-                # 只匹配 T4 创建的那条（幂等测试记录不含 `自测检索验证` 前缀）。
+                # FTS 使用 trigram OR，T9 的幂等记录共享本轮 marker，也可能被召回。
+                # tombstone 的正确判据是目标 id 消失，而不是整个结果集必须为空。
                 items = client.search(
                     f"自测检索验证 {marker}", project_key=SELFTEST_PROJECT, limit=5
                 )
-                return items == [], f"删除后仍命中 {len(items)} 条"
+                target_still_visible = any(item["id"] == target["id"] for item in items)
+                return (
+                    not target_still_visible,
+                    f"目标已隐藏（另有 {len(items)} 条同批次命中）" if not target_still_visible
+                    else f"删除目标 {target['id'][:8]}… 仍可见",
+                )
 
             t("T11", "tombstone 删除", t11)
 
