@@ -173,10 +173,10 @@ export function apply(ctx: Context, config: Config): void {
     },
   }))
 
-  // --- 斜杠命令：结果以 plugin notice 写入会话（agent.steer），供用户回看。
-  //     注入成功时 handler 返回空串，避免命令平面重复渲染；写入会话即进入
-  //     会话历史，后续轮次的模型上下文可见（有少量 token 成本）。 ---
-  type CommandResult = { kind: 'success' | 'error'; text: string }
+  // Slash-command results stay in the native command row and never enter model
+  // context. DSH does not mount a command-only draft until it sees a surface
+  // event, so result() appends one semantic no-op marker before command/done.
+  type CommandResult = { kind: 'success' | 'error'; text: string; sourceEventSeq?: number }
   type CommandInvocation = { rawInput: string; agent?: unknown }
   const commands = (ctx as unknown as {
     commands: {
@@ -194,27 +194,6 @@ export function apply(ctx: Context, config: Config): void {
   }
   const renderResults = (items: MemoryRecord[]): string =>
     renderUntrustedMemories(items) ?? 'No shared memories matched.'
-  // 把命令结果以 plugin notice 消息写入会话，供用户在会话中回看（plan-mode 同款模式）。
-  const steerResult = (invocation: CommandInvocation, commandName: string, text: string): boolean => {
-    const agent = invocation.agent as { steer?: (message: UserMessage) => unknown } | undefined
-    if (!agent?.steer || !text) return false
-    try {
-      agent.steer(createUserMessage({
-        content: [{ type: 'text', text }],
-        source: {
-          kind: 'plugin',
-          plugin: 'shared-brain',
-          form: 'notice',
-          summary: `Shared Brain: ${commandName}`,
-        } as unknown as UserMessage['source'],
-      }))
-      return true
-    } catch {
-      // best-effort: 失败时命令结果仍会渲染在 UI 命令平面
-      return false
-    }
-  }
-
   // --- UX 选择器：无参调用时从列表选择，避免手输（userQuestions 弹窗） ---
   type UserQuestionsService = {
     ask(request: {
@@ -519,12 +498,33 @@ export function apply(ctx: Context, config: Config): void {
       const command = (sub ?? '').toLowerCase()
       const noSelection = (): CommandResult => ({ kind: 'success', text: '' })
       const result = (commandName: string, kind: 'success' | 'error', text: string): CommandResult => {
-        const steered = steerResult(invocation, commandName, text)
-        // A steered notice is visible in the session; agent/pre-step below
-        // rejects the plugin-only wake-up before any model call. Return an empty
-        // success because the host forbids empty error results and would print
-        // non-empty text in the terminal command channel.
-        return steered ? { kind: 'success', text: '' } : { kind, text }
+        const session = (invocation.agent as {
+          session?: {
+            append?: (type: string, data: UserMessage, opts: { surfaceOp: 'append' }) => { seq?: number }
+          }
+        } | undefined)?.session
+        let sourceEventSeq: number | undefined
+        if (text && session?.append) {
+          // A command-only draft is not mounted by DSH until it receives one
+          // surface event. Append a semantic no-op marker; the actual output
+          // remains exclusively in command/done, so later model requests never
+          // receive or reinterpret command results as conversation context.
+          const notice = createUserMessage({
+            content: [{ type: 'text', text: '\u200B' }],
+            source: {
+              kind: 'plugin',
+              plugin: 'shared-brain',
+              form: 'notice',
+              summary: `Shared Brain command: ${commandName}`,
+            } as unknown as UserMessage['source'],
+          })
+          sourceEventSeq = session.append('user/message', notice, { surfaceOp: 'append' }).seq
+        }
+        return {
+          kind,
+          text,
+          ...(sourceEventSeq === undefined ? {} : { sourceEventSeq }),
+        }
       }
       const commandResult = (kind: 'success' | 'error', text: string): CommandResult =>
         result(`brain_${command}`, kind, text)
@@ -803,11 +803,9 @@ export function apply(ctx: Context, config: Config): void {
           if (args && !quick) return usage('/brain test [quick]')
           try {
             const report = await runSelftest(client, { quick })
-            const steered = steerResult(invocation, 'brain_test', report.text)
             return {
               kind: report.passed ? 'success' : 'error',
-              // error 结果必须保留非空文本（宿主契约）
-              text: report.passed && steered ? '' : report.text,
+              text: report.text,
             }
           } catch (error) {
             const text = `Shared Brain selftest failed: ${String(error)}`
@@ -840,13 +838,6 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   ctx.on('agent/pre-step', async ({ messages, step, signal }, next): Promise<PreStepDecision> => {
-    const ownNoticesOnly = messages.length > 0 && messages.every(message => {
-      const source = message.source as { kind?: string; plugin?: string }
-      return source.kind === 'plugin' && source.plugin === 'shared-brain'
-    })
-    // A command success notice is durable UI feedback, not a new human turn.
-    // Do not wake the model just to acknowledge or reinterpret it.
-    if (ownNoticesOnly) return { kind: 'reject' }
     const downstream = await next()
     if (downstream.kind === 'reject' || step !== 1) return downstream
     const query = userText(messages)

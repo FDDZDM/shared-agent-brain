@@ -143,13 +143,20 @@ function makeCtx({
   let askIndex = 0
   const asked = []
   const steered = []
+  const appended = []
   const llmCalls = []
   const tools = new Map()
   const commands = new Map()
   const hooks = new Map()
   let restartCount = 0
   const fakeAgent = {
-    session: { id: agentSessionId },
+    session: {
+      id: agentSessionId,
+      append: (type, data, opts) => {
+        appended.push({ type, data, opts })
+        return { seq: appended.length }
+      },
+    },
     options: { provider: 'test-provider', model: 'test-model', maxTokens: 1200 },
     steer: m => steered.push(m),
   }
@@ -211,6 +218,7 @@ function makeCtx({
     },
     fakeAgent,
     steered,
+    appended,
     llmCalls,
     asked,
     hooks,
@@ -241,8 +249,8 @@ test('remember without args summarizes only the selected session in an isolated 
 
   const result = await run('remember')
   assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.match(steered.at(-1).content[0].text, /已仅基于所选会话提炼并保存 v1/)
+  assert.match(result.text, /已仅基于所选会话提炼并保存 v1/)
+  assert.equal(steered.length, 0)
   assert.equal(llmCalls.length, 1)
   assert.equal(llmCalls[0].provider, 'test-provider')
   assert.equal(llmCalls[0].model, 'test-model')
@@ -404,8 +412,8 @@ test('remember without args skips when nothing unsynced', async t => {
   })
   const result = await run('remember')
   assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.match(steered.at(-1).content[0].text, /没有待同步的会话/)
+  assert.match(result.text, /没有待同步的会话/)
+  assert.equal(steered.length, 0)
 })
 
 test('remember updates the linked memory when a synced session has changed', async t => {
@@ -437,7 +445,8 @@ test('remember updates the linked memory when a synced session has changed', asy
 
   const result = await run('remember')
   assert.equal(result.kind, 'success')
-  assert.match(steered.at(-1).content[0].text, /更新至 v2/)
+  assert.match(result.text, /更新至 v2/)
+  assert.equal(steered.length, 0)
   assert.equal(server.memories.length, 1)
   assert.equal(server.memories[0].id, 'm-linked')
   assert.equal(server.memories[0].current_version, 2)
@@ -464,8 +473,8 @@ test('update without args picks memory then takes new content', async t => {
   })
   const result = await run('update')
   assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.match(steered.at(-1).content[0].text, /Updated to v2/)
+  assert.match(result.text, /Updated to v2/)
+  assert.equal(steered.length, 0)
 })
 
 test('help renders in the session without waking the Agent and bare brain is not help', async t => {
@@ -482,15 +491,13 @@ test('help renders in the session without waking the Agent and bare brain is not
 
   const help = await run('help')
   assert.equal(help.kind, 'success')
-  assert.equal(help.text, '')
-  assert.match(steered[0].content[0].text, /\/brain search/)
+  assert.match(help.text, /\/brain search/)
 
   const bare = await run('')
   assert.equal(bare.kind, 'success')
-  assert.equal(bare.text, '')
-  assert.doesNotMatch(steered[1].content[0].text, /命令说明书/)
-  assert.match(steered[1].content[0].text, /会话可见结果/)
-  assert.equal(steered.length, 2)
+  assert.doesNotMatch(bare.text, /命令说明书/)
+  assert.match(bare.text, /会话可见结果/)
+  assert.equal(steered.length, 0)
 })
 
 test('cancelling a native selector is a silent no-op', async t => {
@@ -555,31 +562,30 @@ test('browse cancellation later in the flow still cancels, not fails', async t =
   assert.doesNotMatch(res.text, /failed/)
 })
 
-test('a steered command result is not returned for duplicate command-plane rendering', async t => {
+test('command results append a session notice without model-facing steer', async t => {
   const server = fakeServer()
   const originalFetch = globalThis.fetch
   globalThis.fetch = server.fetchImpl
   t.after(() => { globalThis.fetch = originalFetch })
-  const { ctx, run, steered, hooks } = makeCtx({ server, answers: [], custom: [] })
+  const { ctx, run, steered, appended } = makeCtx({ server, answers: [], custom: [] })
   apply(ctx, { serverUrl: 'http://brain.test', token: 'tok', agentId: 'Mac-DSH', projectKey: 'alpha' })
 
   const result = await run('remember 项目数据库 | PostgreSQL 16')
 
   assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.equal(steered.length, 1)
-  assert.equal(steered[0].source.kind, 'plugin')
-  assert.equal(steered[0].source.plugin, 'shared-brain')
-  assert.equal(steered[0].source.form, 'notice')
-
-  const decision = await hooks.get('agent/pre-step')(
-    { messages: [steered[0]], step: 1, signal: new AbortController().signal },
-    async () => ({ kind: 'enter', messages: [steered[0]] }),
-  )
-  assert.deepEqual(decision, { kind: 'reject' })
+  assert.match(result.text, /Saved v1/)
+  assert.equal(result.sourceEventSeq, 1)
+  assert.equal(steered.length, 0)
+  assert.equal(appended.length, 1)
+  assert.equal(appended[0].type, 'user/message')
+  assert.equal(appended[0].opts.surfaceOp, 'append')
+  assert.equal(appended[0].data.source.kind, 'plugin')
+  assert.equal(appended[0].data.source.plugin, 'shared-brain')
+  assert.equal(appended[0].data.content[0].text, '\u200B')
+  assert.doesNotMatch(appended[0].data.content[0].text, /Saved v1/)
 })
 
-test('usage errors render as session notices without terminal duplication', async t => {
+test('usage errors render in the native session command row', async t => {
   const server = fakeServer()
   const originalFetch = globalThis.fetch
   globalThis.fetch = server.fetchImpl
@@ -588,28 +594,23 @@ test('usage errors render as session notices without terminal duplication', asyn
   apply(ctx, { serverUrl: 'http://brain.test', token: 'tok', agentId: 'Mac-DSH', projectKey: 'alpha' })
 
   const usage = await run('nonexistent-subcommand')
-  assert.equal(usage.kind, 'success')
-  assert.equal(usage.text, '')
-  assert.match(steered[0].content[0].text, /Usage/)
+  assert.equal(usage.kind, 'error')
+  assert.match(usage.text, /Usage/)
+  assert.equal(steered.length, 0)
 })
 
-test('forget failures render in the session and never become model input', async t => {
+test('forget failures render in the command row and never become model input', async t => {
   const server = fakeServer()
   const originalFetch = globalThis.fetch
   globalThis.fetch = server.fetchImpl
   t.after(() => { globalThis.fetch = originalFetch })
-  const { ctx, run, steered, hooks } = makeCtx({ server, answers: [], custom: [] })
+  const { ctx, run, steered } = makeCtx({ server, answers: [], custom: [] })
   apply(ctx, { serverUrl: 'http://brain.test', token: 'tok', agentId: 'Mac-DSH', projectKey: 'alpha' })
 
   const result = await run('forget missing-memory 1')
-  assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.match(steered[0].content[0].text, /Shared Brain forget failed/)
-  const decision = await hooks.get('agent/pre-step')(
-    { messages: [steered[0]], step: 1, signal: new AbortController().signal },
-    async () => ({ kind: 'enter', messages: [steered[0]] }),
-  )
-  assert.deepEqual(decision, { kind: 'reject' })
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /Shared Brain forget failed/)
+  assert.equal(steered.length, 0)
 })
 
 test('setup validates the runtime and reloads the plugin lifecycle after replying', async t => {
@@ -622,8 +623,8 @@ test('setup validates the runtime and reloads the plugin lifecycle after replyin
 
   const result = await run('setup')
   assert.equal(result.kind, 'success')
-  assert.equal(result.text, '')
-  assert.match(steered.at(-1).content[0].text, /插件生命周期.*重新加载/)
+  assert.match(result.text, /插件生命周期.*重新加载/)
+  assert.equal(steered.length, 0)
   assert.equal(restartCount(), 0, 'reload must not dispose the command before it replies')
   await new Promise(resolve => setTimeout(resolve, 10))
   assert.equal(restartCount(), 1)

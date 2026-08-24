@@ -171,9 +171,13 @@ LLM 提炼；Hermes 端为两步编号文本（`/brain remember <编号> <标题
 cd ~/Projects/shared-agent-brain/integrations/deepseek-harness
 npm run check && npm test && npm run build        # 产出 lib/
 
-# 2) 装入 profile 的 hoisted node_modules
-DEST=~/.dsh/profiles/node_modules/@shared-agent-brain/dsh-plugin
-mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
+# 2) 装入 profile 的 node_modules。Desktop 当前优先从 desktop/node_modules
+#    加载；同时保留 hoisted 副本可兼容旧 profile 布局。
+for DEST in \
+  ~/.dsh/profiles/desktop/node_modules/@shared-agent-brain/dsh-plugin \
+  ~/.dsh/profiles/node_modules/@shared-agent-brain/dsh-plugin; do
+  mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
+done
 
 # 3) ~/.dsh/profiles/desktop/package.json dependencies 加
 #    "@shared-agent-brain/dsh-plugin": "file:../node_modules/@shared-agent-brain/dsh-plugin"
@@ -210,7 +214,7 @@ mkdir -p "$DEST" && cp package.json "$DEST/" && cp -R lib "$DEST/"
 重新配置；刚替换 `lib/` 代码或首次安装包含 `setup` 的版本时，仍需重启 DSH Desktop 才能保证载入新模块。
 Hermes 当前没有对应生命周期，因此完成配置校验后会明确提示重启。
 
-只有 `/brain help` 显示说明书；`/brain`（无参）进入 agent → 会话/记忆的列表选择。DSH 的说明书、成功通知、错误回执和用法提示都会作为 plugin notice 写入会话；注入成功后命令返回空 success，避免终端重复输出，同时 `agent/pre-step` 会拒绝由该 notice 单独唤起的模型步骤，因此 Agent 不会再对 “forget failed” 或 “Saved v1” 作二次解释和追问。只有会话注入接口不可用时才降级到终端。Hermes 缺少对应的 pre-step 拦截能力，所以全部命令结果直接返回，禁止使用会唤醒模型的 `inject_message(role=user)`。平台有原生选项选择器时优先使用，不要求用户读取终端输出后手输编号。
+只有 `/brain help` 显示说明书；`/brain`（无参）进入 agent → 会话/记忆的列表选择。DSH 的说明书、成功通知、错误回执和用法提示统一显示在原生命令结果行；即使是新会话里的第一条命令也能立即显示。插件只追加一个零宽、无语义的会话挂载标记，实际命令结果不会进入模型上下文，也不会唤醒 Agent 对 “forget failed” 或 “Saved v1” 作二次解释。Hermes 同样直接返回命令结果，禁止使用会唤醒模型的 `inject_message(role=user)`。平台有原生选项选择器时优先使用，不要求用户读取终端输出后手输编号。
 
 ---
 
